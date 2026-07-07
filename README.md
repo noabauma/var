@@ -1,0 +1,143 @@
+# slowmo-cam — instant slow-motion replay for game nights
+
+A Raspberry Pi 4 + an OV9281 USB camera (1280×720 @ 120 fps) continuously
+record into RAM. Press **one key** and the last 5 seconds replay immediately
+in 4× slow motion on screen, while the clip is saved to disk in the
+background.
+
+## What's in this repo
+
+| File | What it is |
+|---|---|
+| `slowmo_cam.cpp` | **The recorder** — standalone C++ version (use this one) |
+| `slowmo_cam.py` | The original Python version, kept for reference |
+| `Makefile` | Builds the C++ version |
+
+## Quick start (on the Raspberry Pi)
+
+```bash
+sudo apt install -y g++ make ffmpeg   # ffmpeg only for its `ffplay` replay window
+make
+./slowmo_cam
+```
+
+Clips are saved to `~/recordings/slowmo_YYYYmmdd_HHMMSS.avi`.
+
+## Keys
+
+| Key | Action |
+|---|---|
+| `SPACE` / `s` | Save the last 5 s **and replay it immediately** (4× slow motion, loops) |
+| `r` | Replay the last clip again |
+| *any key* | Stop a running replay (or press `q` inside the replay window) |
+| `q` / `Ctrl-C` | Quit |
+
+## Why this is much faster than the Python version
+
+The slowness you felt on the Pi was almost entirely **SD-card I/O sitting in
+the critical path**, not Python itself:
+
+1. **The old save wrote everything to the SD card twice.** It dumped the
+   buffer to a temp file, then ran ffmpeg to read it back and write the AVI.
+   The new save has its own AVI writer: **one sequential write, no temp
+   file, no ffmpeg process**. Still a lossless remux — frames are never
+   re-encoded.
+2. **The replay no longer waits for the disk at all.** Pressing `s` starts
+   playing straight **from RAM** while the file is written in the
+   background. The old flow was: save to SD → press `r` → ffplay starts →
+   reads the clip back from SD.
+3. **Auto-replay.** `s` does save **+** replay in one press (the old
+   `s`-then-`r` double step is gone) — the table sees the action right away.
+4. **5 s buffer instead of 10 s** — half the data everywhere (RAM, save
+   time, file size). Use `--seconds 10` if you ever want the old window.
+5. **The camera is read directly via V4L2** instead of through an ffmpeg
+   child process whose byte stream had to be re-scanned for JPEG markers in
+   Python. Lower CPU, exact frame boundaries, and a `drops` counter in the
+   status line so you can *see* if the camera ever skips.
+
+## About your `.avi` → `.mp4` idea
+
+The container format has practically **no effect on speed** — inside both
+files sit the exact same MJPEG frames, and both are written without
+re-encoding. The time was lost in the double disk writes and the
+read-back-for-replay described above, so that is what the rewrite removed.
+
+`.avi` is kept because it's the simplest container to write in one pass and
+plays everywhere (`ffplay`, VLC, mpv). If you want an `.mp4` to share (e.g.
+phone/WhatsApp), convert a clip afterwards — instant, lossless:
+
+```bash
+ffmpeg -i slowmo_x.avi -c copy slowmo_x.mp4        # same MJPEG, mp4 container
+```
+
+or re-encode to H.264 for much smaller, universally playable files (slower,
+so do it after game night):
+
+```bash
+ffmpeg -i slowmo_x.avi -c:v libx264 -crf 20 slowmo_x_small.mp4
+```
+
+## Options
+
+```
+--device PATH        camera device            (default /dev/video0)
+--width N            capture width            (default 1280)
+--height N           capture height           (default 720)
+--fps N              capture frame rate       (default 120)
+--playback-fps N     saved/replay frame rate  (default 30 → 4× slow motion)
+--seconds S          seconds kept in RAM      (default 5)
+--out-dir DIR        where clips are saved    (default ~/recordings)
+--player CMD         custom replay command (gets raw MJPEG on stdin),
+                     e.g. --player "mpv --really-quiet -"
+--no-autoreplay      s only saves; use r to replay
+--selftest N         capture N s, save, verify, exit (no keyboard needed)
+--selftest-replay    selftest also plays one replay pass
+--mjpeg-file PATH    test input: raw .mjpeg stream file instead of a camera
+```
+
+## Self-test
+
+On the Pi, with the camera plugged in:
+
+```bash
+./slowmo_cam --selftest 3                    # checks capture fps + saving
+./slowmo_cam --selftest 3 --selftest-replay  # also opens one replay pass
+```
+
+It prints the measured capture rate, the number of buffered frames and
+drops, saves a clip, and exits non-zero if anything failed.
+
+No camera at hand? Generate any raw MJPEG file and run against it:
+
+```bash
+ffmpeg -f lavfi -i testsrc2=duration=4:rate=60:size=1280x720 -c:v mjpeg -f mjpeg test.mjpeg
+./slowmo_cam --mjpeg-file test.mjpeg --fps 60 --selftest 3
+```
+
+## Troubleshooting
+
+- **Buffer fills but fps is far below 120** — the camera didn't get the
+  120 fps mode. Check what it offers:
+  `v4l2-ctl -d /dev/video0 --list-formats-ext` (needs `v4l-utils`).
+  Ask for a mode it really has, e.g. `--width 640 --height 480 --fps 100`.
+- **`drops` climbing in the status line** — frames are being lost between
+  camera and USB; try a shorter cable, a powered hub, or a lower fps.
+- **Replay window doesn't open** — `ffplay` missing (`sudo apt install
+  ffmpeg`) or no display session (`DISPLAY` unset when starting from SSH —
+  run `export DISPLAY=:0` first). Saving still works without it; the
+  program also falls back to opening the saved file if the RAM replay
+  window fails to start.
+- **Nothing saved / buffer 0%** — run `./slowmo_cam --selftest 3` and read
+  the error; it reports exactly which camera step failed.
+
+## How it works
+
+- A capture thread streams compressed MJPEG frames from the camera straight
+  into a RAM ring buffer that always holds the last 5 s. Frames are **never
+  decoded** while recording, so CPU load stays minimal.
+- `s` snapshots the ring (shared pointers — microseconds, capture never
+  pauses), hands it to a background thread that writes the AVI in one
+  sequential pass, and at the same time pipes the frames from RAM into an
+  `ffplay` window at 30 fps → instant 4× slow-motion replay.
+- 120 captured fps played back at 30 fps is the whole slow-motion trick —
+  every real second lasts four seconds on screen, at full quality.

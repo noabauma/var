@@ -1,9 +1,9 @@
 # slowmo-cam — instant slow-motion replay for game nights
 
 A Raspberry Pi 4 + an OV9281 USB camera (1280×720 @ 120 fps) continuously
-record into RAM. Press **one key** and the last 5 seconds replay immediately
-in 4× slow motion on screen, while the clip is saved to disk in the
-background.
+record into RAM. Press **one key** — or **one button on any phone/laptop
+browser** — and the last 5 seconds replay immediately in 4× slow motion,
+while the clip is saved to disk in the background.
 
 ## What's in this repo
 
@@ -31,6 +31,44 @@ Clips are saved to `~/recordings/slowmo_YYYYmmdd_HHMMSS.avi`.
 | `r` | Replay the last clip again |
 | *any key* | Stop a running replay (or press `q` inside the replay window) |
 | `q` / `Ctrl-C` | Quit |
+
+## Live view in the browser (VAR + live cam at the same time)
+
+The recorder itself serves a web page — start `./slowmo_cam` and open:
+
+```
+http://<pi-ip>:8080          # any browser on the same network
+```
+
+Or, when you're connected over SSH, tunnel it (run on your laptop):
+
+```bash
+ssh -L 8080:localhost:8080 noabauma@<pi-ip>   # then open http://localhost:8080
+```
+
+(In an already-open SSH session: press `~C` then type `-L 8080:localhost:8080`.)
+
+The page shows the **live camera**, a status bar (fps / buffer / drops), and
+three buttons — **Save + replay** (same as pressing `s`), **Replay last**,
+**Live** — so any phone on the WiFi can be the VAR trigger. Keyboard works
+there too: `space` save, `r` replay, `l`/`esc` back to live.
+
+**Why live view + VAR work simultaneously:** a UVC camera can only be opened
+by *one* process — two programs would conflict (`Device or resource busy`).
+So the live stream is served *by the recorder itself*: the same compressed
+MJPEG frames that fill the ring buffer are forwarded to the browser as
+`multipart/x-mixed-replace` (natively rendered by every browser in an
+`<img>`). Nothing is decoded or re-encoded, the camera is opened exactly
+once, and streaming costs near-zero CPU. Recording never pauses — saves and
+terminal replays keep working while any number of browsers watch.
+
+Endpoints (for scripting): `GET /stream` (live MJPEG, `?fps=N` to lower the
+rate), `GET /replay` (last clip from RAM, loops), `POST /save` (trigger a
+save, returns JSON), `GET /status` (JSON). No authentication — trusted
+LAN/tunnel only.
+
+**Headless / kiosk use:** without a terminal the program keeps recording and
+serves the web controls (`nohup ./slowmo_cam >/tmp/slowmo.log 2>&1 &`).
 
 ## Why this is much faster than the Python version
 
@@ -93,6 +131,8 @@ ffmpeg -i slowmo_x.avi -c:v libx264 -crf 20 slowmo_x_small.mp4
 --selftest N         capture N s, save, verify, exit (no keyboard needed)
 --selftest-replay    selftest also plays one replay pass
 --mjpeg-file PATH    test input: raw .mjpeg stream file instead of a camera
+--port N             web live view + control port (default 8080, 0 = off)
+--http-fps N         live-stream rate served to browsers (default 30)
 ```
 
 ## Self-test

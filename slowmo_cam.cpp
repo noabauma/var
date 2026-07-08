@@ -17,6 +17,16 @@
 // (MJPEG in AVI, written by this program in one sequential pass —
 // no temp file, no re-encode, no ffmpeg process).
 //
+// Web (same process — the camera is opened exactly once, so the live view
+// and the VAR recorder run simultaneously by construction):
+//   GET  /        control page: live view + save/replay buttons + status
+//   GET  /stream  live camera as multipart MJPEG (?fps=N to limit rate)
+//   GET  /replay  the last saved clip, streamed from RAM at playback fps
+//   POST /save    same as pressing 's': snapshot + save + make replayable
+//   GET  /status  JSON: fps, buffer %, drops, last clip, ...
+// Default port 8080 (--port N, --port 0 disables). Frames are passed
+// through compressed — streaming adds no measurable CPU load.
+//
 // Build:  g++ -O2 -std=c++17 -Wall -o slowmo_cam slowmo_cam.cpp -lpthread
 // Deps:   ffplay (from the ffmpeg package) is used only as the replay window.
 //
@@ -39,9 +49,14 @@
 #include <thread>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -128,6 +143,8 @@ struct Cfg {
     int selftest = 0;             // capture N seconds, save, verify, exit
     bool selftest_replay = false; // selftest also plays one replay pass
     std::string mjpeg_file;       // test input: raw .mjpeg stream instead of camera
+    int http_port = 8080;         // web live view / control (0 = disabled)
+    int http_fps = 30;            // default live-stream rate served to browsers
 
     size_t max_frames() const {
         double f = capture_fps * buffer_seconds;
@@ -153,6 +170,9 @@ static void usage(const char *argv0) {
         "  --selftest-replay    selftest also plays the clip once through the player\n"
         "  --mjpeg-file PATH    read frames from a raw .mjpeg file instead of a\n"
         "                       camera (testing; frames must match --width/--height)\n"
+        "  --port N             web live view + control port (default 8080, 0 = off)\n"
+        "  --http-fps N         live-stream rate served to browsers (default 30;\n"
+        "                       clients may lower it per-connection via /stream?fps=N)\n"
         "  --help               this text\n",
         argv0);
 }
@@ -180,6 +200,8 @@ static bool parse_args(int argc, char **argv, Cfg &cfg) {
         else if (a == "--selftest") { if (!(v = need(i))) return false; cfg.selftest = atoi(v); }
         else if (a == "--selftest-replay") cfg.selftest_replay = true;
         else if (a == "--mjpeg-file") { if (!(v = need(i))) return false; cfg.mjpeg_file = v; }
+        else if (a == "--port") { if (!(v = need(i))) return false; cfg.http_port = atoi(v); }
+        else if (a == "--http-fps") { if (!(v = need(i))) return false; cfg.http_fps = atoi(v); }
         else if (a == "--help" || a == "-h") { usage(argv[0]); exit(0); }
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); return false; }
     }
@@ -189,6 +211,12 @@ static bool parse_args(int argc, char **argv, Cfg &cfg) {
         std::fprintf(stderr, "width/height/fps/playback-fps/seconds must be > 0\n");
         return false;
     }
+    if (cfg.http_port < 0 || cfg.http_port > 65535) {
+        std::fprintf(stderr, "--port must be 0..65535\n");
+        return false;
+    }
+    if (cfg.http_fps <= 0) cfg.http_fps = 30;
+    if (cfg.http_fps > cfg.capture_fps) cfg.http_fps = cfg.capture_fps;
     return true;
 }
 
@@ -225,6 +253,10 @@ public:
     std::shared_ptr<Snapshot> snapshot() const {
         std::lock_guard<std::mutex> lk(m_);
         return std::make_shared<Snapshot>(q_.begin(), q_.end());
+    }
+    Frame latest() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return q_.empty() ? nullptr : q_.back();
     }
 
 private:
@@ -264,6 +296,10 @@ struct Shared {
     std::string error;
     std::mutex path_m;
     std::string last_path; // last successfully saved file
+    std::mutex snap_m;
+    std::shared_ptr<const Snapshot> last_snap; // last saved clip, for replays
+    std::mutex saver_m;
+    std::thread saver; // background AVI writer (at most one at a time)
 
     Shared(size_t maxlen, size_t fps_window) : ring(maxlen, fps_window) {}
 
@@ -282,6 +318,18 @@ struct Shared {
     std::string get_last_path() {
         std::lock_guard<std::mutex> lk(path_m);
         return last_path;
+    }
+    void set_last_snap(std::shared_ptr<const Snapshot> s) {
+        std::lock_guard<std::mutex> lk(snap_m);
+        last_snap = std::move(s);
+    }
+    std::shared_ptr<const Snapshot> get_last_snap() {
+        std::lock_guard<std::mutex> lk(snap_m);
+        return last_snap;
+    }
+    void join_saver() {
+        std::lock_guard<std::mutex> lk(saver_m);
+        if (saver.joinable()) saver.join();
     }
 };
 
@@ -622,6 +670,33 @@ static void saver_thread(std::shared_ptr<const Snapshot> snap, Cfg cfg,
     sh->save_busy = false;
 }
 
+// Snapshot the ring and start the background save. Serialized by saver_m so
+// the terminal 's' key and the web POST /save can fire concurrently. Returns
+// the snapshot (nullptr if the buffer is empty); out_path gets the clip path.
+static std::shared_ptr<const Snapshot> save_now(const Cfg &cfg, Shared &sh,
+                                                std::string *out_path = nullptr) {
+    auto snap = sh.ring.snapshot();
+    if (snap->empty()) {
+        sh.msgs.push("buffer is empty — is the camera running?");
+        return nullptr;
+    }
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lk(sh.saver_m);
+        if (sh.saver.joinable()) sh.saver.join(); // previous save (~a second)
+        path = clip_path(cfg); // after join, so the previous file is visible
+        sh.save_busy = true;
+        sh.saver = std::thread(saver_thread, snap, cfg, &sh, path);
+    }
+    sh.set_last_snap(snap);
+    if (out_path) *out_path = path;
+    char m[256];
+    std::snprintf(m, sizeof m, "saving %zu frames -> %s (in background)",
+                  snap->size(), basename_of(path).c_str());
+    sh.msgs.push(m);
+    return snap;
+}
+
 // ---------------------------------------------------------- V4L2 capture
 
 static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
@@ -798,6 +873,350 @@ static void file_capture_thread(Cfg cfg, Shared *sh) {
     }
 }
 
+// -------------------------------------------------------------- web server
+// Live view + remote VAR control. One listener thread accepts connections;
+// each client gets a detached handler thread. Live frames go out as
+// multipart/x-mixed-replace MJPEG — the camera's own bytes, no transcoding —
+// which every browser renders natively in an <img> tag.
+
+static const char *kHtmlPage = R"HTML(<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>slowmo-cam</title>
+<style>
+:root{color-scheme:dark}
+body{margin:0;background:#0b0e12;color:#dfe6ee;font:15px/1.45 system-ui,sans-serif;display:flex;flex-direction:column;min-height:100vh}
+header{display:flex;align-items:baseline;gap:12px;padding:10px 16px}
+h1{font-size:16px;margin:0;font-weight:600}
+#st{margin-left:auto;font-variant-numeric:tabular-nums;color:#8b96a5;font-size:13px}
+main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10px}
+#wrap{position:relative;width:100%;max-width:1280px}
+#cam{width:100%;display:block;border-radius:10px;background:#000;aspect-ratio:16/9;object-fit:contain}
+#badge{position:absolute;top:12px;left:12px;background:#c0231d;color:#fff;font-weight:700;padding:4px 12px;border-radius:6px;letter-spacing:1px;font-size:13px;animation:p 1s infinite}
+@keyframes p{50%{opacity:.5}}
+footer{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;padding:14px}
+button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:12px 20px;cursor:pointer;background:#1c2530;color:#dfe6ee}
+button:disabled{opacity:.4;cursor:default}
+#save{background:#b3261e;color:#fff}
+kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
+#help{text-align:center;color:#5c6672;font-size:12px;padding-bottom:12px}
+</style>
+<header><h1>slowmo-cam</h1><span id="st">connecting&hellip;</span></header>
+<main><div id="wrap"><img id="cam" src="/stream" alt="live"><div id="badge" hidden>REPLAY</div></div></main>
+<footer>
+<button id="save">&#128308; Save + replay</button>
+<button id="again" disabled>&#8635; Replay last</button>
+<button id="live">&#9679; Live</button>
+</footer>
+<div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
+<script>
+const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');
+let timer=0,replayFrames=0,playFps=30,slow=4;
+function live(){clearTimeout(timer);badge.hidden=true;cam.src='/stream?t='+Date.now();}
+function replay(sec){clearTimeout(timer);badge.textContent='REPLAY '+slow+'× SLOW-MO';badge.hidden=false;
+  cam.src='/replay?t='+Date.now();if(sec>0)timer=setTimeout(live,sec*1000+400);}
+$('save').onclick=async()=>{$('save').disabled=true;
+  try{const j=await(await fetch('/save',{method:'POST'})).json();if(j.ok)replay(j.playback_seconds);}
+  catch(e){}finally{$('save').disabled=false;}};
+$('again').onclick=()=>{if(replayFrames)replay(replayFrames/playFps);};
+$('live').onclick=live;cam.onclick=live;
+addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();$('save').click();}
+  else if(e.key==='r')$('again').click();else if(e.key==='l'||e.key==='Escape')live();});
+cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
+(async function poll(){try{const s=await(await fetch('/status')).json();
+  replayFrames=s.replay_frames;playFps=s.playback_fps;slow=Math.round(s.capture_fps/s.playback_fps);
+  $('again').disabled=!replayFrames;
+  st.textContent=s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'% · drops '+s.drops+(s.save_busy?' · saving…':'');
+}catch(e){st.textContent='⚠ connection lost';}setTimeout(poll,1000);})();
+</script>
+)HTML";
+
+// Registry of open client sockets so shutdown can unblock and wait for them.
+struct HttpState {
+    int listen_fd = -1;
+    std::mutex m;
+    std::vector<int> fds;
+    std::atomic<int> active{0};
+
+    void client_add(int fd) {
+        std::lock_guard<std::mutex> lk(m);
+        fds.push_back(fd);
+        active++;
+    }
+    void client_done(int fd) { // remove from registry BEFORE close(fd)
+        {
+            std::lock_guard<std::mutex> lk(m);
+            for (size_t i = 0; i < fds.size(); i++)
+                if (fds[i] == fd) { fds[i] = fds.back(); fds.pop_back(); break; }
+        }
+        active--;
+    }
+    void shutdown_clients() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            for (int fd : fds) shutdown(fd, SHUT_RDWR);
+        }
+        for (int waited = 0; active.load() > 0 && waited < 3000; waited += 20)
+            usleep(20 * 1000);
+    }
+};
+
+static bool send_all(int fd, const void *data, size_t len, Shared *sh) {
+    const uint8_t *p = (const uint8_t *)data;
+    while (len) {
+        if (!sh->alive || g_stop) return false;
+        ssize_t w = send(fd, p, len, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false; // client gone, or SO_SNDTIMEO hit (stalled client)
+        }
+        p += w;
+        len -= (size_t)w;
+    }
+    return true;
+}
+
+static bool send_str(int fd, const std::string &s, Shared *sh) {
+    return send_all(fd, s.data(), s.size(), sh);
+}
+
+static void send_simple(int fd, Shared *sh, const char *status,
+                        const char *ctype, const std::string &body) {
+    char h[256];
+    std::snprintf(h, sizeof h,
+                  "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                  "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                  status, ctype, body.size());
+    if (send_str(fd, h, sh)) send_str(fd, body, sh);
+}
+
+// Read the request head; returns "METHOD /path" split. Body (none expected
+// beyond an empty POST) is ignored.
+static bool read_request(int fd, std::string &method, std::string &path) {
+    char buf[4096];
+    size_t used = 0;
+    while (used < sizeof buf - 1) {
+        ssize_t r = recv(fd, buf + used, sizeof buf - 1 - used, 0);
+        if (r <= 0) return false; // closed or SO_RCVTIMEO
+        used += (size_t)r;
+        buf[used] = 0;
+        if (strstr(buf, "\r\n\r\n")) break;
+    }
+    char m[8] = {0}, p[2048] = {0};
+    if (std::sscanf(buf, "%7s %2047s", m, p) != 2) return false;
+    method = m;
+    path = p;
+    return true;
+}
+
+static int query_int(const std::string &path, const char *key, int fallback) {
+    size_t q = path.find('?');
+    if (q == std::string::npos) return fallback;
+    std::string qs = path.substr(q + 1);
+    size_t pos = 0;
+    std::string want = std::string(key) + "=";
+    while (pos < qs.size()) {
+        size_t amp = qs.find('&', pos);
+        std::string kv = qs.substr(pos, amp == std::string::npos ? amp : amp - pos);
+        if (kv.compare(0, want.size(), want) == 0) {
+            int v = atoi(kv.c_str() + want.size());
+            return v > 0 ? v : fallback;
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return fallback;
+}
+
+static const char *kMjpegHeader =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+    "Cache-Control: no-store\r\nPragma: no-cache\r\nConnection: close\r\n\r\n";
+
+static bool send_part(int fd, const FrameData &f, Shared *sh) {
+    char h[96];
+    int n = std::snprintf(h, sizeof h,
+                          "--frame\r\nContent-Type: image/jpeg\r\n"
+                          "Content-Length: %zu\r\n\r\n", f.size());
+    return send_all(fd, h, (size_t)n, sh) &&
+           send_all(fd, f.data(), f.size(), sh) &&
+           send_all(fd, "\r\n", 2, sh);
+}
+
+// Live camera -> browser, paced at `fps` (the ring keeps filling at 120).
+static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
+    if (fps > cfg.capture_fps) fps = cfg.capture_fps;
+    if (!send_str(fd, kMjpegHeader, sh)) return;
+    const double period = 1.0 / fps;
+    double next = now_mono();
+    while (sh->alive && !g_stop) {
+        double t = now_mono();
+        if (t < next) {
+            int ms = (int)((next - t) * 1000.0);
+            poll(nullptr, 0, ms > 100 ? 100 : (ms < 1 ? 1 : ms));
+            continue;
+        }
+        Frame f = sh->ring.latest();
+        if (!f) { next = t + 0.1; continue; }
+        if (!send_part(fd, *f, sh)) return;
+        next += period;
+        if (next < t - 1.0) next = t; // stalled client came back: no burst
+    }
+}
+
+// Last saved clip from RAM at playback fps, looping until the client leaves
+// (the control page switches itself back to /stream after one pass).
+static void handle_replay(int fd, const Cfg &cfg, Shared *sh) {
+    auto snap = sh->get_last_snap();
+    if (!snap || snap->empty()) {
+        send_simple(fd, sh, "404 Not Found", "application/json",
+                    "{\"ok\":false,\"error\":\"nothing saved yet\"}");
+        return;
+    }
+    if (!send_str(fd, kMjpegHeader, sh)) return;
+    const double period = 1.0 / cfg.playback_fps;
+    double next = now_mono();
+    size_t i = 0;
+    while (sh->alive && !g_stop) {
+        double t = now_mono();
+        if (t < next) {
+            int ms = (int)((next - t) * 1000.0);
+            poll(nullptr, 0, ms > 100 ? 100 : (ms < 1 ? 1 : ms));
+            continue;
+        }
+        if (!send_part(fd, *(*snap)[i], sh)) return;
+        i = (i + 1) % snap->size();
+        next += period;
+        if (next < t - 1.0) next = t;
+    }
+}
+
+static void handle_save(int fd, const Cfg &cfg, Shared *sh) {
+    std::string path;
+    auto snap = save_now(cfg, *sh, &path);
+    if (!snap) {
+        send_simple(fd, sh, "503 Service Unavailable", "application/json",
+                    "{\"ok\":false,\"error\":\"buffer empty\"}");
+        return;
+    }
+    char body[512];
+    std::snprintf(body, sizeof body,
+                  "{\"ok\":true,\"frames\":%zu,\"playback_seconds\":%.2f,"
+                  "\"file\":\"%s\"}",
+                  snap->size(), (double)snap->size() / cfg.playback_fps,
+                  basename_of(path).c_str());
+    send_simple(fd, sh, "200 OK", "application/json", body);
+}
+
+static void handle_status(int fd, const Cfg &cfg, Shared *sh) {
+    size_t fill = sh->ring.size() * 100 / cfg.max_frames();
+    if (fill > 100) fill = 100;
+    auto snap = sh->get_last_snap();
+    char body[512];
+    std::snprintf(body, sizeof body,
+                  "{\"fps\":%.1f,\"buffer_pct\":%zu,\"frames\":%zu,"
+                  "\"drops\":%llu,\"save_busy\":%s,\"last_clip\":\"%s\","
+                  "\"replay_frames\":%zu,\"capture_fps\":%d,"
+                  "\"playback_fps\":%d,\"buffer_seconds\":%.1f}",
+                  sh->ring.measured_fps(), fill, sh->ring.size(),
+                  (unsigned long long)sh->drops.load(),
+                  sh->save_busy ? "true" : "false",
+                  basename_of(sh->get_last_path()).c_str(),
+                  snap ? snap->size() : 0, cfg.capture_fps, cfg.playback_fps,
+                  cfg.buffer_seconds);
+    send_simple(fd, sh, "200 OK", "application/json", body);
+}
+
+static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
+    timeval tv{5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+
+    std::string method, path;
+    if (read_request(fd, method, path)) {
+        std::string route = path.substr(0, path.find('?'));
+        if (method == "GET" && (route == "/" || route == "/index.html"))
+            send_simple(fd, sh, "200 OK", "text/html; charset=utf-8", kHtmlPage);
+        else if (method == "GET" && route == "/stream")
+            handle_stream(fd, cfg, sh, query_int(path, "fps", cfg.http_fps));
+        else if (method == "GET" && route == "/replay")
+            handle_replay(fd, cfg, sh);
+        else if (method == "POST" && route == "/save")
+            handle_save(fd, cfg, sh);
+        else if (method == "GET" && route == "/status")
+            handle_status(fd, cfg, sh);
+        else if (method == "GET" && route == "/favicon.ico")
+            send_str(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", sh);
+        else
+            send_simple(fd, sh, "404 Not Found", "text/plain", "not found\n");
+    }
+    st->client_done(fd); // deregister first, then close (avoids fd-reuse race)
+    close(fd);
+}
+
+// First non-loopback IPv4, for the startup hint. Best effort.
+static std::string lan_ip() {
+    ifaddrs *ifa = nullptr;
+    std::string ip;
+    if (getifaddrs(&ifa) == 0) {
+        for (ifaddrs *a = ifa; a; a = a->ifa_next) {
+            if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+            char buf[INET_ADDRSTRLEN];
+            auto *sin = (sockaddr_in *)a->ifa_addr;
+            if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof buf)) continue;
+            if (std::strcmp(buf, "127.0.0.1") == 0) continue;
+            ip = buf;
+            break;
+        }
+        freeifaddrs(ifa);
+    }
+    return ip;
+}
+
+static void http_server_thread(Cfg cfg, Shared *sh, HttpState *st) {
+    int lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (lfd < 0) { sh->msgs.push(errno_str("web: socket")); return; }
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)cfg.http_port);
+    if (bind(lfd, (sockaddr *)&addr, sizeof addr) != 0 || listen(lfd, 16) != 0) {
+        char m[160];
+        std::snprintf(m, sizeof m, "web: cannot listen on port %d (%s) — "
+                      "live view disabled", cfg.http_port, std::strerror(errno));
+        sh->msgs.push(m);
+        close(lfd);
+        return;
+    }
+    st->listen_fd = lfd;
+    {
+        std::string ip = lan_ip();
+        char m[256];
+        std::snprintf(m, sizeof m, "live view: http://%s:%d  (via ssh: "
+                      "ssh -L %d:localhost:%d <pi>, then http://localhost:%d)",
+                      ip.empty() ? "<pi-ip>" : ip.c_str(), cfg.http_port,
+                      cfg.http_port, cfg.http_port, cfg.http_port);
+        sh->msgs.push(m);
+    }
+
+    while (sh->alive && !g_stop) {
+        pollfd p{lfd, POLLIN, 0};
+        int r = poll(&p, 1, 200);
+        if (r < 0 && errno != EINTR) break;
+        if (r <= 0 || !(p.revents & POLLIN)) continue;
+        int cfd = accept4(lfd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (cfd < 0) continue;
+        st->client_add(cfd);
+        std::thread(http_client_thread, cfd, cfg, sh, st).detach();
+    }
+    st->shutdown_clients();
+    close(lfd);
+}
+
 // ------------------------------------------------------------- interactive
 
 struct RawTerm {
@@ -822,27 +1241,8 @@ static void print_msgs(Shared &sh) {
         std::printf("\r\033[K  %s\n", m.c_str());
 }
 
-// Start the background save; returns the snapshot (or nullptr if empty).
-static std::shared_ptr<const Snapshot> start_save(const Cfg &cfg, Shared &sh,
-                                                  std::thread &saver) {
-    auto snap = sh.ring.snapshot();
-    if (snap->empty()) {
-        sh.msgs.push("buffer is empty — is the camera running?");
-        return nullptr;
-    }
-    if (saver.joinable()) saver.join(); // previous save (finishes in ~a second)
-    std::string path = clip_path(cfg);
-    sh.save_busy = true;
-    saver = std::thread(saver_thread, snap, cfg, &sh, path);
-    char m[256];
-    std::snprintf(m, sizeof m, "saving %zu frames -> %s (in background)",
-                  snap->size(), basename_of(path).c_str());
-    sh.msgs.push(m);
-    return snap;
-}
-
 static void run_replay(const Snapshot &snap, const Cfg &cfg, Shared &sh,
-                       std::thread &saver, pid_t &file_player) {
+                       pid_t &file_player) {
     double real = (double)snap.size() / cfg.capture_fps;
     double play = (double)snap.size() / cfg.playback_fps;
     std::printf("\r\033[K  replay: %.1fs real -> %.1fs @ %d fps (%.0fx slow-mo), "
@@ -854,7 +1254,7 @@ static void run_replay(const Snapshot &snap, const Cfg &cfg, Shared &sh,
     if (e == ReplayEnd::PlayerFail) {
         sh.msgs.push("replay window failed to start (is ffplay installed and "
                      "DISPLAY set?) — falling back to playing the saved file");
-        if (saver.joinable()) saver.join(); // make sure the file exists
+        sh.join_saver(); // make sure the file exists
         std::string p = sh.get_last_path();
         if (!p.empty()) {
             if (file_player > 0) { kill(file_player, SIGTERM); reap(file_player, 200); }
@@ -865,15 +1265,9 @@ static void run_replay(const Snapshot &snap, const Cfg &cfg, Shared &sh,
     }
 }
 
-static int interactive(const Cfg &cfg, Shared &sh, std::thread &saver) {
-    if (!isatty(0)) {
-        std::fprintf(stderr, "stdin is not a terminal — use --selftest N for "
-                             "non-interactive runs\n");
-        return 1;
-    }
+static int interactive(const Cfg &cfg, Shared &sh) {
     sh.interactive = true;
     RawTerm raw;
-    std::shared_ptr<const Snapshot> last_snap;
     pid_t file_player = -1;
 
     std::printf("Recording %dx%d @ %d fps from %s — keeping the last %.0f s in RAM\n",
@@ -911,16 +1305,16 @@ static int interactive(const Cfg &cfg, Shared &sh, std::thread &saver) {
 
         if (key == 'q' || key == 'Q' || key == 3) break;
         if (key == ' ' || key == 's' || key == 'S') {
-            auto snap = start_save(cfg, sh, saver);
+            auto snap = save_now(cfg, sh);
             if (snap) {
-                last_snap = snap;
                 print_msgs(sh);
                 if (cfg.autoreplay)
-                    run_replay(*snap, cfg, sh, saver, file_player);
+                    run_replay(*snap, cfg, sh, file_player);
             }
         } else if (key == 'r' || key == 'R') {
-            if (last_snap)
-                run_replay(*last_snap, cfg, sh, saver, file_player);
+            auto snap = sh.get_last_snap();
+            if (snap)
+                run_replay(*snap, cfg, sh, file_player);
             else
                 sh.msgs.push("nothing saved yet — press SPACE/s first");
         }
@@ -967,6 +1361,29 @@ static int selftest(const Cfg &cfg, Shared &sh) {
     return 0;
 }
 
+// ---------------------------------------------------------------- headless
+// No tty on stdin (nohup, systemd, ssh without -t): keep recording and let
+// the web page do all the control. Runs until SIGINT/SIGTERM.
+
+static int headless(const Cfg &cfg, Shared &sh) {
+    std::printf("no terminal — headless mode: recording %dx%d @ %d fps, "
+                "control via the web page (Ctrl-C / SIGTERM to quit)\n",
+                cfg.width, cfg.height, cfg.capture_fps);
+    while (!g_stop) {
+        std::string err = sh.get_error();
+        if (!err.empty()) {
+            std::fprintf(stderr, "capture error: %s\n", err.c_str());
+            return 1;
+        }
+        for (const auto &m : sh.msgs.drain()) {
+            std::printf("  %s\n", m.c_str());
+            std::fflush(stdout);
+        }
+        poll(nullptr, 0, 200);
+    }
+    return 0;
+}
+
 // -------------------------------------------------------------------- main
 
 int main(int argc, char **argv) {
@@ -994,21 +1411,30 @@ int main(int argc, char **argv) {
     std::thread cap(cfg.mjpeg_file.empty() ? v4l2_capture_thread
                                            : file_capture_thread,
                     cfg, &sh);
-    std::thread saver;
+    HttpState http_state;
+    std::thread http;
+    if (cfg.http_port > 0 && cfg.selftest == 0)
+        http = std::thread(http_server_thread, cfg, &sh, &http_state);
 
     int rc;
     if (cfg.selftest > 0)
         rc = selftest(cfg, sh);
-    else
-        rc = interactive(cfg, sh, saver);
+    else if (isatty(0))
+        rc = interactive(cfg, sh);
+    else if (http.joinable())
+        rc = headless(cfg, sh);
+    else {
+        std::fprintf(stderr, "stdin is not a terminal and the web port is "
+                             "disabled — use --selftest N or --port N\n");
+        rc = 1;
+    }
 
     sh.alive = false;
     g_stop = 1;
     cap.join();
-    if (saver.joinable()) {
-        if (sh.save_busy) std::printf("finishing save ...\n");
-        saver.join();
-    }
+    if (http.joinable()) http.join(); // unblocks + waits for web clients
+    if (sh.save_busy) std::printf("finishing save ...\n");
+    sh.join_saver();
     for (const auto &m : sh.msgs.drain()) std::printf("  %s\n", m.c_str());
     return rc;
 }

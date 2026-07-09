@@ -73,6 +73,43 @@ def recursive_deletion(M, n_steps = -1):
 
 
 
+def print_win_table(M, team_names=None, title=None):
+    """Print a table of how many times the row team beat the column team.
+
+    Since M_i,j represents the link from 'j' to 'i' (i.e. team 'i' won
+    against team 'j'), entry (row=i, col=j) is exactly the number of wins
+    of team 'i' against team 'j'.
+
+    Args:
+        M (numpy array): adjacency / win matrix
+        team_names (list[str], optional): labels for the teams; defaults to
+            'T0', 'T1', ...
+        title (str, optional): heading printed above the table
+    """
+    n = M.shape[0]
+    if team_names is None:
+        team_names = [f"T{i}" for i in range(n)]
+    assert len(team_names) == n, "Number of team names must match matrix size"
+
+    W = M.astype(int)
+
+    # Column width fits the widest label / count (min 2 for readability)
+    col_w = max(2, max(len(name) for name in team_names), len(str(W.max())))
+    corner_w = max(len(name) for name in team_names)
+
+    if title:
+        print(title)
+    print("(rows = winner, columns = loser)")
+
+    header = " " * corner_w + " | " + " ".join(f"{name:>{col_w}}" for name in team_names)
+    print(header)
+    print("-" * len(header))
+    for i in range(n):
+        cells = " ".join(f"{W[i, j]:>{col_w}}" for j in range(n))
+        print(f"{team_names[i]:>{corner_w}} | {cells}   (won {W[i].sum()})")
+    print()
+
+
 def pagerank(M, d=0.85, participation_bias=True):
     M = M.copy()
     N = M.shape[1]
@@ -115,7 +152,9 @@ if __name__ == "__main__":
                   [0, 0, 0, 1, 0, 0, 0, 0, 0],
                   [0, 0, 0, 1, 0, 0, 0, 0, 0],
                   [0, 0, 0, 0, 0, 0, 0, 0, 0]], dtype=np.float64)
-    
+
+    print_win_table(M, title="Group A — head-to-head wins")
+
     M, disqualified_teams = recursive_deletion(M, 2)
 
     v = pagerank(M, 0.85)
@@ -132,7 +171,9 @@ if __name__ == "__main__":
                   [0, 1, 1, 0, 0, 0, 0, 1, 0],
                   [0, 0, 0, 0, 0, 0, 0, 0, 0],
                   [0, 0, 0, 0, 0, 0, 1, 0, 0]], dtype=np.float64)
-    
+
+    print_win_table(M, title="Group B — head-to-head wins")
+
     M, disqualified_teams = recursive_deletion(M, 1)
 
     v = pagerank(M, 0.85)

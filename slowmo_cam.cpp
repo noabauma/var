@@ -1373,6 +1373,19 @@ button:disabled{opacity:.4;cursor:default}
 .mrow.l{color:#e57373}
 .rn{display:flex;gap:8px;margin-top:10px}
 .rn input{font:inherit;background:#0b0e12;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:7px 10px;flex:1;min-width:8em}
+#board h3{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:20px 0 6px}
+#vswrap{overflow-x:auto}
+#board table.vs{width:auto;font-size:13px}
+#board table.vs th,#board table.vs td{text-align:center;padding:4px 8px;border:1px solid #1c2530;min-width:26px;width:auto;color:#dfe6ee}
+#board table.vs thead th{color:#8b96a5;font-size:12px}
+#board table.vs tbody th{color:#aeb9c7;font-size:12px;text-align:right;white-space:nowrap}
+#board table.vs td.win{color:#81c784;font-weight:700}
+#board table.vs td.z{color:#3b4652}
+#board table.vs td.np{color:#2c3540}
+#board table.vs td.diag{background:#0f151c;color:#39434f}
+#board table.vs .tot{color:#fff;font-weight:700}
+#board table.vs tbody tr{cursor:default}
+#board table.vs tbody tr:hover td{background:none}
 kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 #help{text-align:center;color:#5c6672;font-size:12px;padding-bottom:12px}
 </style>
@@ -1401,6 +1414,8 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button type="button" id="undo">Undo</button>
 </form>
 <div id="serr"></div>
+<h3>Head-to-head</h3>
+<div id="vswrap"></div>
 </section>
 <div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
 <script>
@@ -1450,6 +1465,29 @@ function renderDetail(){const d=$('detail');if(selTeam<0||!S){d.hidden=true;retu
   if(!r.ok){$('serr').textContent=r.error;return;}
   $('serr').textContent='';scores();}catch(e){}};
  d.appendChild(rf);}
+function vcell(cls,txt){const td=document.createElement('td');if(cls)td.className=cls;td.textContent=txt;return td;}
+function renderVs(idx){const wrap=$('vswrap');wrap.innerHTML='';
+ if(!S||!S.teams.length)return;
+ const beat={},played={};
+ S.matches.forEach(m=>{const l=m.winner===m.a?m.b:m.a;beat[m.winner+'_'+l]=1;
+  played[m.a+'_'+m.b]=1;played[m.b+'_'+m.a]=1;});
+ const tbl=document.createElement('table');tbl.className='vs';
+ const thr=document.createElement('tr');
+ const c0=document.createElement('th');c0.textContent='beat \\ lost';thr.appendChild(c0);
+ idx.forEach(j=>{const th=document.createElement('th');th.textContent=S.teams[j].name;thr.appendChild(th);});
+ const wc=document.createElement('th');wc.className='tot';wc.textContent='W';thr.appendChild(wc);
+ const thead=document.createElement('thead');thead.appendChild(thr);tbl.appendChild(thead);
+ const tbody=document.createElement('tbody');
+ idx.forEach(i=>{const tr=document.createElement('tr');
+  const rh=document.createElement('th');rh.textContent=S.teams[i].name;tr.appendChild(rh);
+  let w=0;
+  idx.forEach(j=>{
+   if(i===j){tr.appendChild(vcell('diag','·'));}
+   else if(beat[i+'_'+j]){tr.appendChild(vcell('win','1'));w++;}
+   else if(played[i+'_'+j]){tr.appendChild(vcell('z','0'));}
+   else{tr.appendChild(vcell('np','–'));}});
+  tr.appendChild(vcell('tot',w));tbody.appendChild(tr);});
+ tbl.appendChild(tbody);wrap.appendChild(tbl);}
 function renderTable(){if(!S)return;
  const tb=$('tb'),dl=$('tlist');tb.innerHTML='';dl.innerHTML='';
  const idx=S.teams.map((t,i)=>i).sort((x,y)=>S.teams[y][alg]-S.teams[x][alg]
@@ -1461,7 +1499,7 @@ function renderTable(){if(!S)return;
   if(ti===selTeam)tr.className='sel';
   tb.appendChild(tr);
   const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
- $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';}
+ $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';renderVs(idx);}
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;

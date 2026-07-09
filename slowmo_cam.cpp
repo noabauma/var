@@ -6,7 +6,7 @@
 // so CPU and memory stay low.
 //
 // Keys:
-//   SPACE / s : save the last 8 s AND replay it immediately in slow motion
+//   SPACE / s : save the last 5 s AND replay it immediately in slow motion
 //               (file is written in the background; the replay plays
 //               straight from RAM, so it starts instantly)
 //   r         : replay the last clip again (loops)
@@ -138,7 +138,7 @@ struct Cfg {
     int width = 1280, height = 720;
     int capture_fps = 120;        // what the camera delivers
     int playback_fps = 30;        // saved/replayed rate -> 120/30 = 4x slow-mo
-    double buffer_seconds = 8.0;  // how much history to keep in RAM
+    double buffer_seconds = 5.0;  // how much history to keep in RAM
     std::string out_dir = "~/recordings";
     std::string player;           // custom replay command (stdin = mjpeg); empty = ffplay
     bool autoreplay = true;       // 's' also starts the replay
@@ -167,7 +167,7 @@ static void usage(const char *argv0) {
         "  --height N           capture height (default 720)\n"
         "  --fps N              capture frame rate (default 120)\n"
         "  --playback-fps N     saved/replay frame rate (default 30 => 4x slow-mo)\n"
-        "  --seconds S          seconds of history kept in RAM (default 8)\n"
+        "  --seconds S          seconds of history kept in RAM (default 5)\n"
         "  --max-clips N        keep only the newest N saved clips in out-dir,\n"
         "                       older slowmo_*.avi are deleted (default 20, 0 = keep all)\n"
         "  --out-dir DIR        where clips are saved (default ~/recordings)\n"

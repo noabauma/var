@@ -2,7 +2,7 @@
 
 A Raspberry Pi 4 + an OV9281 USB camera (1280×720 @ 120 fps) continuously
 record into RAM. Press **one key** — or **one button on any phone/laptop
-browser** — and the last 8 seconds replay immediately in 4× slow motion,
+browser** — and the last 5 seconds replay immediately in 4× slow motion,
 while the clip is saved to disk in the background. Only the newest 20
 clips are kept (`--max-clips N`, 0 = keep everything).
 
@@ -28,7 +28,7 @@ Clips are saved to `~/recordings/slowmo_YYYYmmdd_HHMMSS.avi`.
 
 | Key | Action |
 |---|---|
-| `SPACE` / `s` | Save the last 8 s **and replay it immediately** (4× slow motion, loops) |
+| `SPACE` / `s` | Save the last 5 s **and replay it immediately** (4× slow motion, loops) |
 | `r` | Replay the last clip again |
 | *any key* | Stop a running replay (or press `q` inside the replay window) |
 | `q` / `Ctrl-C` | Quit |
@@ -170,7 +170,7 @@ ffmpeg -i slowmo_x.avi -c:v libx264 -crf 20 slowmo_x_small.mp4
 --height N           capture height           (default 720)
 --fps N              capture frame rate       (default 120)
 --playback-fps N     saved/replay frame rate  (default 30 → 4× slow motion)
---seconds S          seconds kept in RAM      (default 8)
+--seconds S          seconds kept in RAM      (default 5)
 --max-clips N        keep only the newest N clips (default 20, 0 = all)
 --out-dir DIR        where clips are saved    (default ~/recordings)
 --player CMD         custom replay command (gets raw MJPEG on stdin),

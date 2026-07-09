@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Bridge between slowmo_cam's web scoreboard and the bias score function.
+"""Bridge between slowmo_cam's web scoreboard and the score functions.
 
-Reads a win matrix on stdin, prints one line of scores on stdout:
+Reads a win matrix on stdin, prints two lines of scores on stdout:
 
     input:  N  followed by N*N matrix entries (whitespace-separated),
-            where M[i][j] = number of times team i beat team j
-    output: N space-separated scores from pagerank(M, participation_bias=True)
+            where M[i][j] = 1 if team i won the (single) match vs team j
+    output: line 1 — bias PageRank  (page_rank_billiardino_algorithm_bias)
+            line 2 — classic PageRank (page_rank_billiardino_algorithm)
 
-The algorithm lives in page_rank_billiardino_algorithm_bias.py — edit it
-there and the live scoreboard follows. recursive_deletion() is intentionally
-NOT applied: it disqualifies the least-connected teams, which is wrong for a
-scoreboard that must rank everyone mid-tournament; the participation bias
-already compensates for uneven numbers of games.
+Both algorithm files stay the single source of truth — edit them and the
+live scoreboard follows. recursive_deletion() is intentionally NOT applied:
+it disqualifies the least-connected teams, which is wrong for a scoreboard
+that must rank everyone mid-tournament.
 """
+import contextlib
+import io
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
-from page_rank_billiardino_algorithm_bias import pagerank
+from page_rank_billiardino_algorithm_bias import pagerank as pagerank_bias
+from page_rank_billiardino_algorithm import pagerank as pagerank_plain
 
 
 def main():
@@ -27,13 +30,18 @@ def main():
     n = int(data[0])
     if n <= 0:
         print()
+        print()
         return
     vals = [float(x) for x in data[1:1 + n * n]]
     if len(vals) != n * n:
         sys.exit("matrix data incomplete")
     M = np.array(vals, dtype=np.float64).reshape(n, n)
-    v = pagerank(M, 0.85, participation_bias=True)
-    print(" ".join(f"{x:.10f}" for x in v))
+    # the classic pagerank() print()s its matrix — keep stdout clean
+    with contextlib.redirect_stdout(io.StringIO()):
+        vb = pagerank_bias(M.copy(), 0.85, participation_bias=True)
+        vp = pagerank_plain(M.copy(), 0.85)
+    print(" ".join(f"{x:.10f}" for x in vb))
+    print(" ".join(f"{x:.10f}" for x in vp))
 
 
 if __name__ == "__main__":

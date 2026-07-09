@@ -67,30 +67,46 @@ rate), `GET /replay` (last clip from RAM, loops), `POST /save` (trigger a
 save, returns JSON), `GET /status` (JSON). No authentication — trusted
 LAN/tunnel only.
 
-## Tournament scoreboard (bias PageRank)
+## Tournament scoreboard
 
-The web page also shows the **current tournament ranking**, computed with
-the *bias* score function in
-`score_function/page_rank_billiardino_algorithm_bias.py` — that Python file
-stays the single source of truth: the recorder calls it through
-`score_function/compute_scores.py`, so tweaking the algorithm immediately
-changes the live board. (`recursive_deletion` is deliberately not applied:
-it disqualifies the least-connected teams, which is wrong mid-tournament;
-the participation bias already compensates for uneven game counts.)
+The web page shows the **current tournament ranking**, switchable between
+the two score functions (both computed on every change, so the toggle is
+instant):
 
-Enter results directly on the page: type **winner** / **loser** (existing
-teams autocomplete; new names create new teams) and press **Add result**.
-**Undo** removes the last entered match. Everything persists in a plain
-TSV file (default `~/recordings/tournament.tsv`).
+- **Bias PageRank** — `page_rank_billiardino_algorithm_bias.py`
+  (baseline ∝ games played, compensates uneven participation)
+- **Classic PageRank** — `page_rank_billiardino_algorithm.py`
 
-- First run seeds the board with **last year's group A dummy matrix** so you
-  can see it working. To start the real tournament fresh, empty the file:
-  `: > ~/recordings/tournament.tsv` and restart (deleting it instead would
-  re-seed the demo).
-- Endpoints: `GET /scores` (rankings as JSON),
-  `POST /scores/add?winner=X&loser=Y`, `POST /scores/undo`.
-- Options: `--scores-file PATH`, `--scores-script PATH`, `--no-scores`.
-- Needs `python3` + `numpy` (already on the Pi).
+Both Python files stay the single source of truth: the recorder calls them
+through `score_function/compute_scores.py`, so tweaking an algorithm
+immediately changes the live board. (`recursive_deletion` is deliberately
+not applied: it disqualifies the least-connected teams, which is wrong
+mid-tournament.)
+
+**Entering matches** — one big group, every match is a **best of three**
+to 10, and **each pair of teams plays at most once**:
+
+- Fill in *team A*, *team B* and the game scores **from A's perspective**,
+  e.g. `10-9, 10-4` (2-0) or `10-1, 5-10, 10-9` (2-1). The winner is
+  derived from the games; incomplete or impossible best-of-threes are
+  rejected, as is a rematch of a pair that already played (undo it first).
+- New team names create new teams automatically; existing ones autocomplete.
+- **Click a team row** to see all its matches (`vs Team X: 10-1, 5-10, 10-9
+  → won`) and to **rename** the team (results follow the team, scores are
+  unaffected).
+- **Undo** removes the last entered match.
+
+State persists in a plain TSV (default `~/recordings/tournament.tsv`).
+First run seeds **last year's group A dummy data** so the board shows
+something. Start the real tournament fresh with
+`: > ~/recordings/tournament.tsv` and a restart (deleting the file instead
+would re-seed the demo).
+
+Endpoints: `GET /scores` (both scores + all matches, JSON),
+`POST /scores/add?a=X&b=Y&games=10-9,10-4`,
+`POST /scores/rename?team=X&name=Y`, `POST /scores/undo`.
+Options: `--scores-file PATH`, `--scores-script PATH`, `--no-scores`.
+Needs `python3` + `numpy` (already on the Pi).
 
 **Headless / kiosk use:** without a terminal the program keeps recording and
 serves the web controls (`nohup ./slowmo_cam >/tmp/slowmo.log 2>&1 &`).

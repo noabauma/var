@@ -974,12 +974,19 @@ static void json_escape(std::string &dst, const std::string &s) {
 }
 
 struct ScoreBoard {
+    struct Game { int a, b; }; // one game's points, from team A's perspective
+    struct Match {
+        int a, b;                // team indices; each pair plays at most once
+        std::vector<Game> games; // may be empty (legacy entries)
+        int winner;              // == a or b, derived from games won
+    };
+
     std::mutex m;
     std::string file;   // TSV persistence
     std::string script; // compute_scores.py
     std::vector<std::string> teams;
-    std::vector<std::pair<int, int>> matches; // (winner, loser) team indices
-    std::vector<double> cache;                // per-team scores; empty = stale
+    std::vector<Match> matches;
+    std::vector<double> cache_bias, cache_plain; // per-team; empty = stale
     std::string cache_err;
 
     static constexpr size_t kMaxTeams = 64;
@@ -1006,6 +1013,69 @@ struct ScoreBoard {
         return (int)teams.size() - 1;
     }
 
+    int find_match_locked(int a, int b) const {
+        for (size_t i = 0; i < matches.size(); i++)
+            if ((matches[i].a == a && matches[i].b == b) ||
+                (matches[i].a == b && matches[i].b == a)) return (int)i;
+        return -1;
+    }
+
+    // -1 = tied overall (no winner), else the winning team's index
+    static int winner_of(int a, int b, const std::vector<Game> &games) {
+        int wa = 0, wb = 0;
+        for (const auto &g : games) (g.a > g.b ? wa : wb)++;
+        return wa == wb ? -1 : (wa > wb ? a : b);
+    }
+
+    static std::string games_str(const Match &mt) {
+        std::string s;
+        for (size_t i = 0; i < mt.games.size(); i++) {
+            if (i) s += ",";
+            s += std::to_string(mt.games[i].a) + "-" + std::to_string(mt.games[i].b);
+        }
+        return s;
+    }
+
+    // "10-1, 5-10, 10-9" -> games; rejects ties, junk, and empty input
+    static bool parse_games(const std::string &s, std::vector<Game> &out,
+                            std::string &err) {
+        out.clear();
+        const char *fmt_hint = "scores must look like: 10-1, 5-10, 10-9";
+        size_t pos = 0;
+        while (pos < s.size()) {
+            while (pos < s.size() && (s[pos] == ' ' || s[pos] == ',')) pos++;
+            if (pos >= s.size()) break;
+            char *end;
+            long x = strtol(s.c_str() + pos, &end, 10);
+            if (end == s.c_str() + pos) { err = fmt_hint; return false; }
+            const char *p = end;
+            while (*p == ' ') p++;
+            if (*p != '-') { err = fmt_hint; return false; }
+            p++;
+            while (*p == ' ') p++;
+            char *end2;
+            long y = strtol(p, &end2, 10);
+            if (end2 == p) { err = fmt_hint; return false; }
+            if (x < 0 || y < 0 || x > 999 || y > 999) {
+                err = "game points out of range";
+                return false;
+            }
+            if (x == y) {
+                err = "a game cannot end tied (" + std::to_string(x) + "-" +
+                      std::to_string(y) + ")";
+                return false;
+            }
+            out.push_back({(int)x, (int)y});
+            if (out.size() > 15) { err = "too many games in one match"; return false; }
+            pos = (size_t)(end2 - s.c_str());
+        }
+        if (out.empty()) {
+            err = "enter the game scores, e.g. 10-1, 5-10, 10-9";
+            return false;
+        }
+        return true;
+    }
+
     bool save_locked(std::string &err) {
         std::string tmp = file + ".tmp";
         FILE *fh = std::fopen(tmp.c_str(), "w");
@@ -1013,8 +1083,11 @@ struct ScoreBoard {
         bool ok = true;
         for (const auto &t : teams)
             ok = ok && std::fprintf(fh, "team\t%s\n", t.c_str()) > 0;
-        for (const auto &mt : matches)
-            ok = ok && std::fprintf(fh, "match\t%d\t%d\n", mt.first, mt.second) > 0;
+        for (const auto &mt : matches) {
+            std::string g = games_str(mt);
+            ok = ok && std::fprintf(fh, "match\t%d\t%d\t%s\t%d\n", mt.a, mt.b,
+                                    g.empty() ? "-" : g.c_str(), mt.winner) > 0;
+        }
         ok = std::fflush(fh) == 0 && ok && !ferror(fh);
         std::fclose(fh);
         if (!ok || rename(tmp.c_str(), file.c_str()) != 0) {
@@ -1043,11 +1116,27 @@ struct ScoreBoard {
                                             ? "Team " + std::to_string(teams.size() + 1)
                                             : nm);
                 } else if (s.compare(0, 6, "match\t") == 0) {
-                    int w = -1, l = -1;
-                    if (std::sscanf(s.c_str() + 6, "%d\t%d", &w, &l) == 2 &&
-                        w >= 0 && l >= 0 && w != l &&
-                        w < (int)teams.size() && l < (int)teams.size())
-                        matches.emplace_back(w, l);
+                    int a = -1, b = -1, w = -1;
+                    char gbuf[192] = {0};
+                    int got = std::sscanf(s.c_str() + 6, "%d\t%d\t%191[^\t]\t%d",
+                                          &a, &b, gbuf, &w);
+                    if (got == 2) w = a; // legacy "match\twinner\tloser"
+                    else if (got != 4) continue;
+                    if (a < 0 || b < 0 || a == b || (w != a && w != b) ||
+                        a >= (int)teams.size() || b >= (int)teams.size())
+                        continue;
+                    if (find_match_locked(a, b) >= 0) continue; // one per pair
+                    Match mt{a, b, {}, w};
+                    if (got == 4 && std::strcmp(gbuf, "-") != 0) {
+                        std::vector<Game> gs;
+                        std::string gerr;
+                        if (parse_games(gbuf, gs, gerr) &&
+                            winner_of(a, b, gs) >= 0) {
+                            mt.games = gs;
+                            mt.winner = winner_of(a, b, gs);
+                        }
+                    }
+                    matches.push_back(mt);
                 }
             }
             std::fclose(fh);
@@ -1065,19 +1154,27 @@ struct ScoreBoard {
             teams.push_back("Team " + std::to_string(i + 1));
         for (int i = 0; i < 9; i++)
             for (int j = 0; j < 9; j++)
-                if (demo[i][j]) matches.emplace_back(i, j);
+                if (demo[i][j]) // plausible fake best-of-three (2-0) for the demo
+                    matches.push_back({i, j,
+                                       {{10, (3 * i + 5 * j + 7) % 10},
+                                        {10, (7 * i + 2 * j + 3) % 10}},
+                                       i});
         std::string err;
         if (!save_locked(err)) msgs.push("scoreboard: " + err);
         msgs.push("scoreboard: seeded demo tournament (last year's group A) -> " + file);
     }
 
     void recompute_locked() {
-        cache.clear();
+        cache_bias.clear();
+        cache_plain.clear();
         cache_err.clear();
         const size_t n = teams.size();
         if (n == 0) return;
-        std::vector<double> M(n * n, 0.0); // M[i][j] = wins of i over j
-        for (const auto &mt : matches) M[mt.first * n + mt.second] += 1.0;
+        std::vector<double> M(n * n, 0.0); // M[i][j] = 1 if i won the match vs j
+        for (const auto &mt : matches) {
+            int l = mt.winner == mt.a ? mt.b : mt.a;
+            M[(size_t)mt.winner * n + l] += 1.0;
+        }
         std::string in = std::to_string(n);
         char num[32];
         for (size_t i = 0; i < n * n; i++) {
@@ -1089,64 +1186,131 @@ struct ScoreBoard {
         if (!run_script(script, in, out, err, 30000)) { cache_err = err; return; }
         const char *p = out.c_str();
         char *end;
-        for (size_t i = 0; i < n; i++) {
+        for (size_t i = 0; i < 2 * n; i++) { // line 1 bias, line 2 classic
             double v = strtod(p, &end);
             if (end == p) {
                 cache_err = "unexpected score script output";
-                cache.clear();
+                cache_bias.clear();
+                cache_plain.clear();
                 return;
             }
-            cache.push_back(v);
+            (i < n ? cache_bias : cache_plain).push_back(v);
             p = end;
         }
     }
 
     std::string scores_json() {
         std::lock_guard<std::mutex> lk(m);
-        if (cache.size() != teams.size()) recompute_locked();
+        const size_t n = teams.size();
+        if (cache_bias.size() != n || cache_plain.size() != n) recompute_locked();
         if (!cache_err.empty()) {
             std::string j = "{\"ok\":false,\"error\":\"";
             json_escape(j, cache_err);
             return j + "\"}";
         }
-        const size_t n = teams.size();
         std::vector<int> wins(n, 0), losses(n, 0);
-        for (const auto &mt : matches) { wins[mt.first]++; losses[mt.second]++; }
-        std::vector<size_t> order(n);
-        for (size_t i = 0; i < n; i++) order[i] = i;
-        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            if (cache[a] != cache[b]) return cache[a] > cache[b];
-            return teams[a] < teams[b];
-        });
-        std::string j = "{\"ok\":true,\"algorithm\":\"pagerank_bias\",\"matches\":" +
-                        std::to_string(matches.size()) + ",\"teams\":[";
-        char buf[128];
-        for (size_t k = 0; k < n; k++) {
-            size_t i = order[k];
-            if (k) j += ',';
+        for (const auto &mt : matches) {
+            wins[mt.winner]++;
+            losses[mt.winner == mt.a ? mt.b : mt.a]++;
+        }
+        // teams in index order with both scores; the page sorts client-side,
+        // so switching algorithms needs no server round-trip
+        std::string j = "{\"ok\":true,\"teams\":[";
+        char buf[160];
+        for (size_t i = 0; i < n; i++) {
+            if (i) j += ',';
             j += "{\"name\":\"";
             json_escape(j, teams[i]);
             std::snprintf(buf, sizeof buf,
-                          "\",\"score\":%.6f,\"wins\":%d,\"losses\":%d}",
-                          cache[i], wins[i], losses[i]);
+                          "\",\"bias\":%.6f,\"plain\":%.6f,\"wins\":%d,\"losses\":%d}",
+                          cache_bias[i], cache_plain[i], wins[i], losses[i]);
             j += buf;
+        }
+        j += "],\"matches\":[";
+        for (size_t k = 0; k < matches.size(); k++) {
+            const Match &mt = matches[k];
+            if (k) j += ',';
+            std::snprintf(buf, sizeof buf,
+                          "{\"a\":%d,\"b\":%d,\"winner\":%d,\"games\":[",
+                          mt.a, mt.b, mt.winner);
+            j += buf;
+            for (size_t g = 0; g < mt.games.size(); g++) {
+                if (g) j += ',';
+                std::snprintf(buf, sizeof buf, "[%d,%d]", mt.games[g].a,
+                              mt.games[g].b);
+                j += buf;
+            }
+            j += "]}";
         }
         return j + "]}";
     }
 
-    bool add_match(const std::string &w_raw, const std::string &l_raw,
-                   std::string &err) {
-        std::string w = sanitize_name(w_raw), l = sanitize_name(l_raw);
-        if (w.empty() || l.empty()) { err = "winner and loser must both be named"; return false; }
-        if (w == l) { err = "winner and loser are the same team"; return false; }
+    bool add_match(const std::string &a_raw, const std::string &b_raw,
+                   const std::string &games_raw, std::string &err) {
+        std::string an = sanitize_name(a_raw), bn = sanitize_name(b_raw);
+        if (an.empty() || bn.empty()) { err = "both team names are required"; return false; }
+        if (an == bn) { err = "a team cannot play itself"; return false; }
+        std::vector<Game> gs;
+        if (!parse_games(games_raw, gs, err)) return false;
+        int wa = 0, wb = 0;
+        for (const auto &g : gs) (g.a > g.b ? wa : wb)++;
+        // best-of-three: complete matches are exactly 2-0 or 2-1 in games
+        int hi = wa > wb ? wa : wb, lo = wa + wb - hi;
+        if (hi != 2 || lo > 1) {
+            err = "best-of-three: a match ends when a team wins its 2nd game "
+                  "— enter 2 or 3 games, e.g. 10-9, 10-4  or  10-1, 5-10, 10-9";
+            return false;
+        }
         std::lock_guard<std::mutex> lk(m);
-        int wi = find_or_add_locked(w), li = find_or_add_locked(l);
-        if (wi < 0 || li < 0) {
+        // all validation happens before find_or_add: a rejected add must not
+        // leave new teams on the roster
+        int ai = -1, bi = -1;
+        for (size_t i = 0; i < teams.size(); i++) {
+            if (teams[i] == an) ai = (int)i;
+            if (teams[i] == bn) bi = (int)i;
+        }
+        if (ai >= 0 && bi >= 0) {
+            int prev = find_match_locked(ai, bi);
+            if (prev >= 0) {
+                const Match &p = matches[prev];
+                err = teams[p.a] + " vs " + teams[p.b] + " was already played (" +
+                      (p.games.empty() ? "no game scores" : games_str(p)) +
+                      ", " + teams[p.winner] + " won) — each pair plays at " +
+                      "most once; undo it first if it is wrong";
+                return false;
+            }
+        }
+        if (ai < 0) ai = find_or_add_locked(an);
+        if (bi < 0) bi = find_or_add_locked(bn);
+        if (ai < 0 || bi < 0) {
             err = "too many teams (max " + std::to_string(kMaxTeams) + ")";
             return false;
         }
-        matches.emplace_back(wi, li);
-        cache.clear();
+        matches.push_back({ai, bi, gs, wa > wb ? ai : bi}); // hi==2 => no tie
+        cache_bias.clear();
+        cache_plain.clear();
+        return save_locked(err);
+    }
+
+    bool rename_team(const std::string &old_raw, const std::string &new_raw,
+                     std::string &err) {
+        std::string oldn = sanitize_name(old_raw), newn = sanitize_name(new_raw);
+        if (oldn.empty() || newn.empty()) {
+            err = "team and its new name are both required";
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(m);
+        int oi = -1;
+        for (size_t i = 0; i < teams.size(); i++)
+            if (teams[i] == oldn) { oi = (int)i; break; }
+        if (oi < 0) { err = "no team named \"" + oldn + "\""; return false; }
+        if (newn == oldn) return true;
+        for (const auto &t : teams)
+            if (t == newn) {
+                err = "a team named \"" + newn + "\" already exists";
+                return false;
+            }
+        teams[oi] = newn; // matches reference indices: scores are unaffected
         return save_locked(err);
     }
 
@@ -1154,7 +1318,8 @@ struct ScoreBoard {
         std::lock_guard<std::mutex> lk(m);
         if (matches.empty()) { err = "no matches to undo"; return false; }
         matches.pop_back(); // teams stay on the roster
-        cache.clear();
+        cache_bias.clear();
+        cache_plain.clear();
         return save_locked(err);
     }
 };
@@ -1195,6 +1360,19 @@ button:disabled{opacity:.4;cursor:default}
 #af input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;min-width:8em;flex:1}
 #af button{padding:9px 14px}
 #serr{color:#e57373;font-size:13px;min-height:1.2em;margin-top:6px}
+#algsw{display:flex;gap:8px;margin-bottom:10px}
+#algsw button{padding:7px 12px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
+#algsw button.on{background:#1c2530;border-color:#3b82f6;color:#fff}
+#board tbody tr{cursor:pointer}
+#board tbody tr:hover td,#board tr.sel td{background:#141a21}
+#detail{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:12px;margin-top:10px;font-size:14px}
+.dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.xbtn{background:none;padding:2px 8px}
+.mrow{padding:3px 0;color:#8b96a5}
+.mrow.w{color:#81c784}
+.mrow.l{color:#e57373}
+.rn{display:flex;gap:8px;margin-top:10px}
+.rn input{font:inherit;background:#0b0e12;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:7px 10px;flex:1;min-width:8em}
 kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 #help{text-align:center;color:#5c6672;font-size:12px;padding-bottom:12px}
 </style>
@@ -1206,14 +1384,20 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button id="live">&#9679; Live</button>
 </footer>
 <section id="board">
-<h2>Tournament &middot; bias PageRank</h2>
+<h2>Tournament</h2>
+<div id="algsw">
+<button id="algb" class="on">Bias PageRank</button>
+<button id="algp">Classic PageRank</button>
+</div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
+<div id="detail" hidden></div>
 <form id="af">
-<input id="win" list="tlist" placeholder="winner" maxlength="40" required autocomplete="off">
-<span>beat</span>
-<input id="los" list="tlist" placeholder="loser" maxlength="40" required autocomplete="off">
+<input id="ta" list="tlist" placeholder="team A" maxlength="40" required autocomplete="off">
+<span>vs</span>
+<input id="tb2" list="tlist" placeholder="team B" maxlength="40" required autocomplete="off">
+<input id="tg" placeholder="10-1, 5-10, 10-9" required autocomplete="off">
 <datalist id="tlist"></datalist>
-<button type="submit">Add result</button>
+<button type="submit">Add match</button>
 <button type="button" id="undo">Undo</button>
 </form>
 <div id="serr"></div>
@@ -1239,21 +1423,57 @@ cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
   $('again').disabled=!replayFrames;
   st.textContent=s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'% · drops '+s.drops+(s.save_busy?' · saving…':'');
 }catch(e){st.textContent='⚠ connection lost';}setTimeout(poll,1000);})();
-async function scores(){try{const s=await(await fetch('/scores')).json();
- if(!s.ok){$('serr').textContent=s.error;return;}
- $('serr').textContent='';
+let S=null,alg='bias',selTeam=-1;
+function fmtGames(m,fromA){return m.games.map(g=>fromA?g[0]+'-'+g[1]:g[1]+'-'+g[0]).join(', ');}
+function renderDetail(){const d=$('detail');if(selTeam<0||!S){d.hidden=true;return;}
+ d.hidden=false;d.innerHTML='';
+ const h=document.createElement('div');h.className='dh';
+ const nm=document.createElement('b');nm.textContent=S.teams[selTeam].name;h.appendChild(nm);
+ const x=document.createElement('button');x.textContent='✕';x.className='xbtn';
+ x.onclick=()=>{selTeam=-1;renderDetail();};h.appendChild(x);d.appendChild(h);
+ const ms=S.matches.filter(m=>m.a===selTeam||m.b===selTeam);
+ if(!ms.length){const p=document.createElement('div');p.className='mrow';
+  p.textContent='no matches yet';d.appendChild(p);}
+ ms.forEach(m=>{const isA=m.a===selTeam,opp=isA?m.b:m.a,won=m.winner===selTeam;
+  const row=document.createElement('div');row.className='mrow '+(won?'w':'l');
+  row.textContent='vs '+S.teams[opp].name+': '
+   +(m.games.length?fmtGames(m,isA):'(no game scores)')
+   +' → '+(won?'won':'lost');
+  d.appendChild(row);});
+ const rf=document.createElement('form');rf.className='rn';
+ const ri=document.createElement('input');ri.maxLength=40;ri.placeholder='rename to…';
+ rf.appendChild(ri);
+ const rb=document.createElement('button');rb.textContent='Rename';rf.appendChild(rb);
+ rf.onsubmit=async e=>{e.preventDefault();
+  try{const r=await(await fetch('/scores/rename?team='+encodeURIComponent(S.teams[selTeam].name)
+   +'&name='+encodeURIComponent(ri.value),{method:'POST'})).json();
+  if(!r.ok){$('serr').textContent=r.error;return;}
+  $('serr').textContent='';scores();}catch(e){}};
+ d.appendChild(rf);}
+function renderTable(){if(!S)return;
  const tb=$('tb'),dl=$('tlist');tb.innerHTML='';dl.innerHTML='';
- s.teams.forEach((t,i)=>{const tr=document.createElement('tr');
-  [i+1,t.name,(t.score*100).toFixed(2),t.wins,t.losses].forEach(v=>{
+ const idx=S.teams.map((t,i)=>i).sort((x,y)=>S.teams[y][alg]-S.teams[x][alg]
+  ||S.teams[x].name.localeCompare(S.teams[y].name));
+ idx.forEach((ti,r)=>{const t=S.teams[ti],tr=document.createElement('tr');
+  [r+1,t.name,(t[alg]*100).toFixed(2),t.wins,t.losses].forEach(v=>{
    const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});
+  tr.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
+  if(ti===selTeam)tr.className='sel';
   tb.appendChild(tr);
   const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
-}catch(e){}}
+ $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';}
+async function scores(){try{const s=await(await fetch('/scores')).json();
+ if(!s.ok){$('serr').textContent=s.error;return;}
+ $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
+ renderTable();renderDetail();}catch(e){}}
+$('algb').onclick=()=>{alg='bias';renderTable();};
+$('algp').onclick=()=>{alg='plain';renderTable();};
 $('af').addEventListener('submit',async e=>{e.preventDefault();
- try{const r=await(await fetch('/scores/add?winner='+encodeURIComponent($('win').value)
-  +'&loser='+encodeURIComponent($('los').value),{method:'POST'})).json();
+ try{const r=await(await fetch('/scores/add?a='+encodeURIComponent($('ta').value)
+  +'&b='+encodeURIComponent($('tb2').value)
+  +'&games='+encodeURIComponent($('tg').value),{method:'POST'})).json();
  if(!r.ok){$('serr').textContent=r.error;return;}
- $('win').value='';$('los').value='';scores();}catch(e){}});
+ $('ta').value='';$('tb2').value='';$('tg').value='';scores();}catch(e){}});
 $('undo').onclick=async()=>{try{const r=await(await fetch('/scores/undo',{method:'POST'})).json();
  if(!r.ok)$('serr').textContent=r.error;else scores();}catch(e){}};
 scores();setInterval(scores,10000);
@@ -1510,7 +1730,21 @@ static void handle_scores_add(int fd, Shared *sh, const std::string &path) {
         return;
     }
     std::string err;
-    if (!sh->scores->add_match(query_str(path, "winner"), query_str(path, "loser"), err)) {
+    if (!sh->scores->add_match(query_str(path, "a"), query_str(path, "b"),
+                               query_str(path, "games"), err)) {
+        scores_error(fd, sh, "400 Bad Request", err);
+        return;
+    }
+    send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
+}
+
+static void handle_scores_rename(int fd, Shared *sh, const std::string &path) {
+    if (!sh->scores) {
+        scores_error(fd, sh, "503 Service Unavailable", "scoreboard disabled");
+        return;
+    }
+    std::string err;
+    if (!sh->scores->rename_team(query_str(path, "team"), query_str(path, "name"), err)) {
         scores_error(fd, sh, "400 Bad Request", err);
         return;
     }
@@ -1554,6 +1788,8 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_scores(fd, sh);
         else if (method == "POST" && route == "/scores/add")
             handle_scores_add(fd, sh, path);
+        else if (method == "POST" && route == "/scores/rename")
+            handle_scores_rename(fd, sh, path);
         else if (method == "POST" && route == "/scores/undo")
             handle_scores_undo(fd, sh);
         else if (method == "GET" && route == "/favicon.ico")

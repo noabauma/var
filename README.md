@@ -2,8 +2,9 @@
 
 A Raspberry Pi 4 + an OV9281 USB camera (1280×720 @ 120 fps) continuously
 record into RAM. Press **one key** — or **one button on any phone/laptop
-browser** — and the last 5 seconds replay immediately in 4× slow motion,
-while the clip is saved to disk in the background.
+browser** — and the last 8 seconds replay immediately in 4× slow motion,
+while the clip is saved to disk in the background. Only the newest 20
+clips are kept (`--max-clips N`, 0 = keep everything).
 
 ## What's in this repo
 
@@ -27,7 +28,7 @@ Clips are saved to `~/recordings/slowmo_YYYYmmdd_HHMMSS.avi`.
 
 | Key | Action |
 |---|---|
-| `SPACE` / `s` | Save the last 5 s **and replay it immediately** (4× slow motion, loops) |
+| `SPACE` / `s` | Save the last 8 s **and replay it immediately** (4× slow motion, loops) |
 | `r` | Replay the last clip again |
 | *any key* | Stop a running replay (or press `q` inside the replay window) |
 | `q` / `Ctrl-C` | Quit |
@@ -91,9 +92,12 @@ to 10, and **each pair of teams plays at most once**:
   derived from the games; incomplete or impossible best-of-threes are
   rejected, as is a rematch of a pair that already played (undo it first).
 - New team names create new teams automatically; existing ones autocomplete.
+  Teams can also be added explicitly (**Add team**) before they play.
 - **Click a team row** to see all its matches (`vs Team X: 10-1, 5-10, 10-9
-  → won`) and to **rename** the team (results follow the team, scores are
-  unaffected).
+  → won`) — each match there can be **edited** (✎, fix the game scores;
+  the winner is re-derived) or **deleted** (🗑). The panel also offers
+  **rename** (results follow the team) and **Delete team** (removes the
+  team and all its matches).
 - **Undo** removes the last entered match.
 
 State persists in a plain TSV (default `~/recordings/tournament.tsv`).
@@ -104,7 +108,9 @@ would re-seed the demo).
 
 Endpoints: `GET /scores` (both scores + all matches, JSON),
 `POST /scores/add?a=X&b=Y&games=10-9,10-4`,
-`POST /scores/rename?team=X&name=Y`, `POST /scores/undo`.
+`POST /scores/rename?team=X&name=Y`, `POST /scores/undo`,
+`POST /scores/team/add?name=X`, `POST /scores/team/delete?name=X`,
+`POST /scores/match/edit?a=X&b=Y&games=…`, `POST /scores/match/delete?a=X&b=Y`.
 Options: `--scores-file PATH`, `--scores-script PATH`, `--no-scores`.
 Needs `python3` + `numpy` (already on the Pi).
 
@@ -164,7 +170,8 @@ ffmpeg -i slowmo_x.avi -c:v libx264 -crf 20 slowmo_x_small.mp4
 --height N           capture height           (default 720)
 --fps N              capture frame rate       (default 120)
 --playback-fps N     saved/replay frame rate  (default 30 → 4× slow motion)
---seconds S          seconds kept in RAM      (default 5)
+--seconds S          seconds kept in RAM      (default 8)
+--max-clips N        keep only the newest N clips (default 20, 0 = all)
 --out-dir DIR        where clips are saved    (default ~/recordings)
 --player CMD         custom replay command (gets raw MJPEG on stdin),
                      e.g. --player "mpv --really-quiet -"

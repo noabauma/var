@@ -6,7 +6,7 @@
 // so CPU and memory stay low.
 //
 // Keys:
-//   SPACE / s : save the last 5 s AND replay it immediately in slow motion
+//   SPACE / s : save the last 8 s AND replay it immediately in slow motion
 //               (file is written in the background; the replay plays
 //               straight from RAM, so it starts instantly)
 //   r         : replay the last clip again (loops)
@@ -138,13 +138,14 @@ struct Cfg {
     int width = 1280, height = 720;
     int capture_fps = 120;        // what the camera delivers
     int playback_fps = 30;        // saved/replayed rate -> 120/30 = 4x slow-mo
-    double buffer_seconds = 5.0;  // how much history to keep in RAM
+    double buffer_seconds = 8.0;  // how much history to keep in RAM
     std::string out_dir = "~/recordings";
     std::string player;           // custom replay command (stdin = mjpeg); empty = ffplay
     bool autoreplay = true;       // 's' also starts the replay
     int selftest = 0;             // capture N seconds, save, verify, exit
     bool selftest_replay = false; // selftest also plays one replay pass
     std::string mjpeg_file;       // test input: raw .mjpeg stream instead of camera
+    int max_clips = 20;           // keep at most N saved clips (0 = unlimited)
     int http_port = 8080;         // web live view / control (0 = disabled)
     int http_fps = 30;            // default live-stream rate served to browsers
     std::string scores_script = "~/src/var/score_function/compute_scores.py";
@@ -166,7 +167,9 @@ static void usage(const char *argv0) {
         "  --height N           capture height (default 720)\n"
         "  --fps N              capture frame rate (default 120)\n"
         "  --playback-fps N     saved/replay frame rate (default 30 => 4x slow-mo)\n"
-        "  --seconds S          seconds of history kept in RAM (default 5)\n"
+        "  --seconds S          seconds of history kept in RAM (default 8)\n"
+        "  --max-clips N        keep only the newest N saved clips in out-dir,\n"
+        "                       older slowmo_*.avi are deleted (default 20, 0 = keep all)\n"
         "  --out-dir DIR        where clips are saved (default ~/recordings)\n"
         "  --player CMD         replay command run via sh -c, mjpeg on its stdin\n"
         "                       (default: built-in ffplay window)\n"
@@ -209,6 +212,7 @@ static bool parse_args(int argc, char **argv, Cfg &cfg) {
         else if (a == "--selftest") { if (!(v = need(i))) return false; cfg.selftest = atoi(v); }
         else if (a == "--selftest-replay") cfg.selftest_replay = true;
         else if (a == "--mjpeg-file") { if (!(v = need(i))) return false; cfg.mjpeg_file = v; }
+        else if (a == "--max-clips") { if (!(v = need(i))) return false; cfg.max_clips = atoi(v); }
         else if (a == "--port") { if (!(v = need(i))) return false; cfg.http_port = atoi(v); }
         else if (a == "--http-fps") { if (!(v = need(i))) return false; cfg.http_fps = atoi(v); }
         else if (a == "--scores-script") { if (!(v = need(i))) return false; cfg.scores_script = v; }
@@ -663,6 +667,32 @@ static std::string clip_path(const Cfg &cfg) {
     return path;
 }
 
+// Delete the oldest slowmo_*.avi in out_dir beyond cfg.max_clips. Clip names
+// start with a timestamp, so lexicographic order == chronological order.
+static void prune_clips(const Cfg &cfg, Shared *sh) {
+    if (cfg.max_clips <= 0) return;
+    DIR *d = opendir(cfg.out_dir.c_str());
+    if (!d) return;
+    std::vector<std::string> clips;
+    dirent *e;
+    while ((e = readdir(d)) != nullptr) {
+        std::string n = e->d_name;
+        if (n.size() > 11 && n.compare(0, 7, "slowmo_") == 0 &&
+            n.compare(n.size() - 4, 4, ".avi") == 0)
+            clips.push_back(n);
+    }
+    closedir(d);
+    if ((int)clips.size() <= cfg.max_clips) return;
+    std::sort(clips.begin(), clips.end());
+    size_t doomed = clips.size() - (size_t)cfg.max_clips;
+    for (size_t i = 0; i < doomed; i++)
+        unlink((cfg.out_dir + "/" + clips[i]).c_str());
+    char msg[96];
+    std::snprintf(msg, sizeof msg, "pruned %zu old clip%s (keeping newest %d)",
+                  doomed, doomed == 1 ? "" : "s", cfg.max_clips);
+    sh->msgs.push(msg);
+}
+
 static void saver_thread(std::shared_ptr<const Snapshot> snap, Cfg cfg,
                          Shared *sh, std::string path) {
     double t0 = now_mono();
@@ -685,6 +715,7 @@ static void saver_thread(std::shared_ptr<const Snapshot> snap, Cfg cfg,
         std::snprintf(msg, sizeof msg, "save FAILED: %s", err.c_str());
     }
     sh->msgs.push(msg);
+    if (ok) prune_clips(cfg, sh);
     sh->save_busy = false;
 }
 
@@ -1027,6 +1058,36 @@ struct ScoreBoard {
         return wa == wb ? -1 : (wa > wb ? a : b);
     }
 
+    // best-of-three: a complete match is exactly 2-0 or 2-1 in games
+    static bool bo3_ok(const std::vector<Game> &gs, int &wa, int &wb,
+                       std::string &err) {
+        wa = wb = 0;
+        for (const auto &g : gs) (g.a > g.b ? wa : wb)++;
+        int hi = wa > wb ? wa : wb, lo = wa + wb - hi;
+        if (hi != 2 || lo > 1) {
+            err = "best-of-three: a match ends when a team wins its 2nd game "
+                  "— enter 2 or 3 games, e.g. 10-9, 10-4  or  10-1, 5-10, 10-9";
+            return false;
+        }
+        return true;
+    }
+
+    // resolve two team names to an existing head-to-head match; -1 + err if
+    // either team or the pair's match does not exist
+    int find_pair_locked(const std::string &an, const std::string &bn,
+                         int &ai, int &bi, std::string &err) {
+        ai = bi = -1;
+        for (size_t i = 0; i < teams.size(); i++) {
+            if (teams[i] == an) ai = (int)i;
+            if (teams[i] == bn) bi = (int)i;
+        }
+        if (ai < 0) { err = "no team named \"" + an + "\""; return -1; }
+        if (bi < 0) { err = "no team named \"" + bn + "\""; return -1; }
+        int idx = find_match_locked(ai, bi);
+        if (idx < 0) err = an + " vs " + bn + " has not been played yet";
+        return idx;
+    }
+
     static std::string games_str(const Match &mt) {
         std::string s;
         for (size_t i = 0; i < mt.games.size(); i++) {
@@ -1252,15 +1313,8 @@ struct ScoreBoard {
         if (an == bn) { err = "a team cannot play itself"; return false; }
         std::vector<Game> gs;
         if (!parse_games(games_raw, gs, err)) return false;
-        int wa = 0, wb = 0;
-        for (const auto &g : gs) (g.a > g.b ? wa : wb)++;
-        // best-of-three: complete matches are exactly 2-0 or 2-1 in games
-        int hi = wa > wb ? wa : wb, lo = wa + wb - hi;
-        if (hi != 2 || lo > 1) {
-            err = "best-of-three: a match ends when a team wins its 2nd game "
-                  "— enter 2 or 3 games, e.g. 10-9, 10-4  or  10-1, 5-10, 10-9";
-            return false;
-        }
+        int wa, wb;
+        if (!bo3_ok(gs, wa, wb, err)) return false;
         std::lock_guard<std::mutex> lk(m);
         // all validation happens before find_or_add: a rejected add must not
         // leave new teams on the roster
@@ -1322,6 +1376,86 @@ struct ScoreBoard {
         cache_plain.clear();
         return save_locked(err);
     }
+
+    bool add_team(const std::string &raw, std::string &err) {
+        std::string nm = sanitize_name(raw);
+        if (nm.empty()) { err = "team name required"; return false; }
+        std::lock_guard<std::mutex> lk(m);
+        for (const auto &t : teams)
+            if (t == nm) {
+                err = "a team named \"" + nm + "\" already exists";
+                return false;
+            }
+        if (teams.size() >= kMaxTeams) {
+            err = "too many teams (max " + std::to_string(kMaxTeams) + ")";
+            return false;
+        }
+        teams.push_back(nm);
+        cache_bias.clear(); // roster size changes both rankings
+        cache_plain.clear();
+        return save_locked(err);
+    }
+
+    // Removes the team and every match it played; remaining matches are
+    // reindexed to the shrunken roster.
+    bool delete_team(const std::string &raw, std::string &err) {
+        std::string nm = sanitize_name(raw);
+        if (nm.empty()) { err = "team name required"; return false; }
+        std::lock_guard<std::mutex> lk(m);
+        int ti = -1;
+        for (size_t i = 0; i < teams.size(); i++)
+            if (teams[i] == nm) { ti = (int)i; break; }
+        if (ti < 0) { err = "no team named \"" + nm + "\""; return false; }
+        matches.erase(std::remove_if(matches.begin(), matches.end(),
+                                     [ti](const Match &mt) {
+                                         return mt.a == ti || mt.b == ti;
+                                     }),
+                      matches.end());
+        for (auto &mt : matches) {
+            if (mt.a > ti) mt.a--;
+            if (mt.b > ti) mt.b--;
+            if (mt.winner > ti) mt.winner--;
+        }
+        teams.erase(teams.begin() + ti);
+        cache_bias.clear();
+        cache_plain.clear();
+        return save_locked(err);
+    }
+
+    // Replace the games of an existing head-to-head match (scores are read
+    // from team a's perspective, like add_match).
+    bool edit_match(const std::string &a_raw, const std::string &b_raw,
+                    const std::string &games_raw, std::string &err) {
+        std::string an = sanitize_name(a_raw), bn = sanitize_name(b_raw);
+        if (an.empty() || bn.empty()) { err = "both team names are required"; return false; }
+        if (an == bn) { err = "a team cannot play itself"; return false; }
+        std::vector<Game> gs;
+        if (!parse_games(games_raw, gs, err)) return false;
+        int wa, wb;
+        if (!bo3_ok(gs, wa, wb, err)) return false;
+        std::lock_guard<std::mutex> lk(m);
+        int ai, bi;
+        int idx = find_pair_locked(an, bn, ai, bi, err);
+        if (idx < 0) return false;
+        matches[idx] = {ai, bi, gs, wa > wb ? ai : bi};
+        cache_bias.clear();
+        cache_plain.clear();
+        return save_locked(err);
+    }
+
+    bool delete_match(const std::string &a_raw, const std::string &b_raw,
+                      std::string &err) {
+        std::string an = sanitize_name(a_raw), bn = sanitize_name(b_raw);
+        if (an.empty() || bn.empty()) { err = "both team names are required"; return false; }
+        std::lock_guard<std::mutex> lk(m);
+        int ai, bi;
+        int idx = find_pair_locked(an, bn, ai, bi, err);
+        if (idx < 0) return false;
+        matches.erase(matches.begin() + idx);
+        cache_bias.clear();
+        cache_plain.clear();
+        return save_locked(err);
+    }
 };
 
 // -------------------------------------------------------------- web server
@@ -1368,11 +1502,18 @@ button:disabled{opacity:.4;cursor:default}
 #detail{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:12px;margin-top:10px;font-size:14px}
 .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .xbtn{background:none;padding:2px 8px}
-.mrow{padding:3px 0;color:#8b96a5}
+.mrow{padding:3px 0;color:#8b96a5;display:flex;align-items:center;gap:2px}
+.mrow span{flex:1}
 .mrow.w{color:#81c784}
 .mrow.l{color:#e57373}
-.rn{display:flex;gap:8px;margin-top:10px}
+.mbtn{background:none;padding:0 6px;font-size:13px;opacity:.7}
+.mbtn:hover{opacity:1}
+.rn{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .rn input{font:inherit;background:#0b0e12;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:7px 10px;flex:1;min-width:8em}
+.danger{background:#5c1f1c;color:#fbb}
+#tf{display:flex;gap:8px;margin-top:8px}
+#tf input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;flex:1;min-width:8em}
+#tf button{padding:9px 14px}
 #board h3{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:20px 0 6px}
 #vswrap{overflow-x:auto}
 #board table.vs{width:auto;font-size:13px}
@@ -1413,6 +1554,10 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button type="submit">Add match</button>
 <button type="button" id="undo">Undo</button>
 </form>
+<form id="tf">
+<input id="tn" placeholder="new team name" maxlength="40" required autocomplete="off">
+<button type="submit">Add team</button>
+</form>
 <div id="serr"></div>
 <h3>Head-to-head</h3>
 <div id="vswrap"></div>
@@ -1439,31 +1584,51 @@ cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
   st.textContent=s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'% · drops '+s.drops+(s.save_busy?' · saving…':'');
 }catch(e){st.textContent='⚠ connection lost';}setTimeout(poll,1000);})();
 let S=null,alg='bias',selTeam=-1;
+const enc=encodeURIComponent;
+async function post(u){try{const r=await(await fetch(u,{method:'POST'})).json();
+ if(!r.ok){$('serr').textContent=r.error;return false;}
+ $('serr').textContent='';scores();return true;}catch(e){return false;}}
 function fmtGames(m,fromA){return m.games.map(g=>fromA?g[0]+'-'+g[1]:g[1]+'-'+g[0]).join(', ');}
 function renderDetail(){const d=$('detail');if(selTeam<0||!S){d.hidden=true;return;}
  d.hidden=false;d.innerHTML='';
+ const me=S.teams[selTeam].name;
  const h=document.createElement('div');h.className='dh';
- const nm=document.createElement('b');nm.textContent=S.teams[selTeam].name;h.appendChild(nm);
+ const nm=document.createElement('b');nm.textContent=me;h.appendChild(nm);
  const x=document.createElement('button');x.textContent='✕';x.className='xbtn';
  x.onclick=()=>{selTeam=-1;renderDetail();};h.appendChild(x);d.appendChild(h);
  const ms=S.matches.filter(m=>m.a===selTeam||m.b===selTeam);
  if(!ms.length){const p=document.createElement('div');p.className='mrow';
   p.textContent='no matches yet';d.appendChild(p);}
- ms.forEach(m=>{const isA=m.a===selTeam,opp=isA?m.b:m.a,won=m.winner===selTeam;
+ ms.forEach(m=>{const isA=m.a===selTeam,opp=S.teams[isA?m.b:m.a].name,won=m.winner===selTeam;
   const row=document.createElement('div');row.className='mrow '+(won?'w':'l');
-  row.textContent='vs '+S.teams[opp].name+': '
+  const txt=document.createElement('span');
+  txt.textContent='vs '+opp+': '
    +(m.games.length?fmtGames(m,isA):'(no game scores)')
    +' → '+(won?'won':'lost');
+  row.appendChild(txt);
+  const eb=document.createElement('button');eb.textContent='✎';eb.className='mbtn';
+  eb.title='edit game scores';
+  eb.onclick=()=>{const nv=prompt('Game scores '+me+' vs '+opp
+   +" (from "+me+"'s view):",m.games.length?fmtGames(m,isA):'');
+   if(nv!=null)post('/scores/match/edit?a='+enc(me)+'&b='+enc(opp)+'&games='+enc(nv));};
+  const db=document.createElement('button');db.textContent='🗑';db.className='mbtn';
+  db.title='delete this match';
+  db.onclick=()=>{if(confirm('Delete the match '+me+' vs '+opp+'?'))
+   post('/scores/match/delete?a='+enc(me)+'&b='+enc(opp));};
+  row.appendChild(eb);row.appendChild(db);
   d.appendChild(row);});
  const rf=document.createElement('form');rf.className='rn';
  const ri=document.createElement('input');ri.maxLength=40;ri.placeholder='rename to…';
  rf.appendChild(ri);
  const rb=document.createElement('button');rb.textContent='Rename';rf.appendChild(rb);
- rf.onsubmit=async e=>{e.preventDefault();
-  try{const r=await(await fetch('/scores/rename?team='+encodeURIComponent(S.teams[selTeam].name)
-   +'&name='+encodeURIComponent(ri.value),{method:'POST'})).json();
-  if(!r.ok){$('serr').textContent=r.error;return;}
-  $('serr').textContent='';scores();}catch(e){}};
+ rf.onsubmit=e=>{e.preventDefault();
+  post('/scores/rename?team='+enc(me)+'&name='+enc(ri.value));};
+ const td=document.createElement('button');td.type='button';td.textContent='Delete team';
+ td.className='danger';
+ td.onclick=()=>{if(confirm('Delete '+me
+   +(ms.length?' and its '+ms.length+' match(es)?':'?')))
+  {selTeam=-1;post('/scores/team/delete?name='+enc(me));}};
+ rf.appendChild(td);
  d.appendChild(rf);}
 function vcell(cls,txt){const td=document.createElement('td');if(cls)td.className=cls;td.textContent=txt;return td;}
 function renderVs(idx){const wrap=$('vswrap');wrap.innerHTML='';
@@ -1512,8 +1677,9 @@ $('af').addEventListener('submit',async e=>{e.preventDefault();
   +'&games='+encodeURIComponent($('tg').value),{method:'POST'})).json();
  if(!r.ok){$('serr').textContent=r.error;return;}
  $('ta').value='';$('tb2').value='';$('tg').value='';scores();}catch(e){}});
-$('undo').onclick=async()=>{try{const r=await(await fetch('/scores/undo',{method:'POST'})).json();
- if(!r.ok)$('serr').textContent=r.error;else scores();}catch(e){}};
+$('undo').onclick=()=>post('/scores/undo');
+$('tf').addEventListener('submit',async e=>{e.preventDefault();
+ if(await post('/scores/team/add?name='+enc($('tn').value)))$('tn').value='';});
 scores();setInterval(scores,10000);
 </script>
 )HTML";
@@ -1802,6 +1968,15 @@ static void handle_scores_undo(int fd, Shared *sh) {
     send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
 }
 
+// shared tail for the team/match management endpoints
+static void scores_mutation(int fd, Shared *sh, bool ok, const std::string &err) {
+    if (!ok) {
+        scores_error(fd, sh, "400 Bad Request", err);
+        return;
+    }
+    send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
+}
+
 static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     timeval tv{5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -1830,6 +2005,25 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_scores_rename(fd, sh, path);
         else if (method == "POST" && route == "/scores/undo")
             handle_scores_undo(fd, sh);
+        else if (method == "POST" && route == "/scores/team/add" && sh->scores) {
+            std::string err;
+            scores_mutation(fd, sh, sh->scores->add_team(query_str(path, "name"), err), err);
+        } else if (method == "POST" && route == "/scores/team/delete" && sh->scores) {
+            std::string err;
+            scores_mutation(fd, sh, sh->scores->delete_team(query_str(path, "name"), err), err);
+        } else if (method == "POST" && route == "/scores/match/edit" && sh->scores) {
+            std::string err;
+            scores_mutation(fd, sh,
+                            sh->scores->edit_match(query_str(path, "a"), query_str(path, "b"),
+                                                   query_str(path, "games"), err),
+                            err);
+        } else if (method == "POST" && route == "/scores/match/delete" && sh->scores) {
+            std::string err;
+            scores_mutation(fd, sh,
+                            sh->scores->delete_match(query_str(path, "a"),
+                                                     query_str(path, "b"), err),
+                            err);
+        }
         else if (method == "GET" && route == "/favicon.ico")
             send_str(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", sh);
         else

@@ -35,11 +35,13 @@
 //   ./slowmo_cam --selftest 3      # capture 3 s, auto-save, verify, exit
 //   ./slowmo_cam --help            # all options
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <csignal>
 #include <ctime>
 #include <deque>
@@ -145,6 +147,9 @@ struct Cfg {
     std::string mjpeg_file;       // test input: raw .mjpeg stream instead of camera
     int http_port = 8080;         // web live view / control (0 = disabled)
     int http_fps = 30;            // default live-stream rate served to browsers
+    std::string scores_script = "~/src/var/score_function/compute_scores.py";
+    std::string scores_file;      // tournament state; default <out_dir>/tournament.tsv
+    bool no_scores = false;       // disable the web scoreboard
 
     size_t max_frames() const {
         double f = capture_fps * buffer_seconds;
@@ -173,6 +178,10 @@ static void usage(const char *argv0) {
         "  --port N             web live view + control port (default 8080, 0 = off)\n"
         "  --http-fps N         live-stream rate served to browsers (default 30;\n"
         "                       clients may lower it per-connection via /stream?fps=N)\n"
+        "  --scores-script PATH python bridge computing the tournament scores\n"
+        "                       (default ~/src/var/score_function/compute_scores.py)\n"
+        "  --scores-file PATH   tournament state (default <out-dir>/tournament.tsv)\n"
+        "  --no-scores          disable the web scoreboard\n"
         "  --help               this text\n",
         argv0);
 }
@@ -202,10 +211,16 @@ static bool parse_args(int argc, char **argv, Cfg &cfg) {
         else if (a == "--mjpeg-file") { if (!(v = need(i))) return false; cfg.mjpeg_file = v; }
         else if (a == "--port") { if (!(v = need(i))) return false; cfg.http_port = atoi(v); }
         else if (a == "--http-fps") { if (!(v = need(i))) return false; cfg.http_fps = atoi(v); }
+        else if (a == "--scores-script") { if (!(v = need(i))) return false; cfg.scores_script = v; }
+        else if (a == "--scores-file") { if (!(v = need(i))) return false; cfg.scores_file = v; }
+        else if (a == "--no-scores") cfg.no_scores = true;
         else if (a == "--help" || a == "-h") { usage(argv[0]); exit(0); }
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); return false; }
     }
     cfg.out_dir = expand_home(cfg.out_dir);
+    cfg.scores_script = expand_home(cfg.scores_script);
+    cfg.scores_file = expand_home(cfg.scores_file);
+    if (cfg.scores_file.empty()) cfg.scores_file = cfg.out_dir + "/tournament.tsv";
     if (cfg.width <= 0 || cfg.height <= 0 || cfg.capture_fps <= 0 ||
         cfg.playback_fps <= 0 || cfg.buffer_seconds <= 0) {
         std::fprintf(stderr, "width/height/fps/playback-fps/seconds must be > 0\n");
@@ -285,9 +300,12 @@ private:
     std::vector<std::string> v_;
 };
 
+struct ScoreBoard; // tournament rankings, defined after the capture threads
+
 struct Shared {
     Ring ring;
     MessageQueue msgs;
+    ScoreBoard *scores = nullptr; // web scoreboard (null = disabled)
     std::atomic<bool> alive{true};
     std::atomic<bool> save_busy{false};
     std::atomic<bool> interactive{false};
@@ -873,6 +891,274 @@ static void file_capture_thread(Cfg cfg, Shared *sh) {
     }
 }
 
+// ------------------------------------------------------------- score board
+// Tournament rankings for the web page. Match results (who beat whom) are a
+// simple TSV file; the scores come from the *bias* PageRank in
+// score_function/page_rank_billiardino_algorithm_bias.py, called through
+// score_function/compute_scores.py — the Python file stays the single
+// source of truth for the algorithm, so edits there flow to the live board.
+
+// Run `python3 script` with `input` on stdin, collect stdout. Bounded by
+// timeout_ms (numpy's import on a Pi can take a couple of seconds cold).
+static bool run_script(const std::string &script, const std::string &input,
+                       std::string &output, std::string &err, int timeout_ms) {
+    int in_p[2], out_p[2];
+    if (pipe2(in_p, O_CLOEXEC) != 0) { err = errno_str("pipe"); return false; }
+    if (pipe2(out_p, O_CLOEXEC) != 0) {
+        err = errno_str("pipe");
+        close(in_p[0]); close(in_p[1]);
+        return false;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        err = errno_str("fork");
+        close(in_p[0]); close(in_p[1]); close(out_p[0]); close(out_p[1]);
+        return false;
+    }
+    if (pid == 0) {
+        dup2(in_p[0], 0);
+        dup2(out_p[1], 1); // stderr stays: script errors land in our log
+        execlp("python3", "python3", script.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    close(in_p[0]);
+    close(out_p[1]);
+    bool wok = true;
+    size_t off = 0;
+    while (off < input.size()) { // matrix is a few KB — fits the pipe buffer
+        ssize_t w = write(in_p[1], input.data() + off, input.size() - off);
+        if (w < 0) { if (errno == EINTR) continue; wok = false; break; }
+        off += (size_t)w;
+    }
+    close(in_p[1]);
+    const double deadline = now_mono() + timeout_ms / 1000.0;
+    char buf[4096];
+    bool timed_out = false;
+    for (;;) {
+        if (g_stop) { timed_out = true; break; } // shutting down: abort
+        double left = deadline - now_mono();
+        if (left <= 0) { timed_out = true; break; }
+        pollfd p{out_p[0], POLLIN, 0};
+        int r = poll(&p, 1, 200);
+        if (r < 0 && errno != EINTR) break;
+        if (r <= 0) continue;
+        ssize_t n = read(out_p[0], buf, sizeof buf);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        if (n == 0) break; // EOF
+        output.append(buf, (size_t)n);
+    }
+    close(out_p[0]);
+    if (timed_out) {
+        kill(pid, SIGKILL);
+        waitpid(pid, nullptr, 0);
+        err = "score script timed out";
+        return false;
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!wok) { err = "write to score script failed"; return false; }
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        err = "score script failed (exit " +
+              std::to_string(WIFEXITED(st) ? WEXITSTATUS(st) : -1) +
+              ", see terminal for its stderr)";
+        return false;
+    }
+    return true;
+}
+
+static void json_escape(std::string &dst, const std::string &s) {
+    for (char c : s) {
+        if (c == '"' || c == '\\') dst += '\\';
+        dst += c; // names are sanitized: no control characters left
+    }
+}
+
+struct ScoreBoard {
+    std::mutex m;
+    std::string file;   // TSV persistence
+    std::string script; // compute_scores.py
+    std::vector<std::string> teams;
+    std::vector<std::pair<int, int>> matches; // (winner, loser) team indices
+    std::vector<double> cache;                // per-team scores; empty = stale
+    std::string cache_err;
+
+    static constexpr size_t kMaxTeams = 64;
+    static constexpr size_t kMaxNameLen = 40;
+
+    // printable, no tabs/newlines (TSV + JSON safety), trimmed, length-capped
+    static std::string sanitize_name(const std::string &s) {
+        std::string out;
+        for (char c : s)
+            if ((unsigned char)c >= 0x20 && c != 0x7f) out += c;
+        size_t a = out.find_first_not_of(' ');
+        if (a == std::string::npos) return "";
+        size_t b = out.find_last_not_of(' ');
+        out = out.substr(a, b - a + 1);
+        if (out.size() > kMaxNameLen) out.resize(kMaxNameLen);
+        return out;
+    }
+
+    int find_or_add_locked(const std::string &name) {
+        for (size_t i = 0; i < teams.size(); i++)
+            if (teams[i] == name) return (int)i;
+        if (teams.size() >= kMaxTeams) return -1;
+        teams.push_back(name);
+        return (int)teams.size() - 1;
+    }
+
+    bool save_locked(std::string &err) {
+        std::string tmp = file + ".tmp";
+        FILE *fh = std::fopen(tmp.c_str(), "w");
+        if (!fh) { err = errno_str("open " + tmp); return false; }
+        bool ok = true;
+        for (const auto &t : teams)
+            ok = ok && std::fprintf(fh, "team\t%s\n", t.c_str()) > 0;
+        for (const auto &mt : matches)
+            ok = ok && std::fprintf(fh, "match\t%d\t%d\n", mt.first, mt.second) > 0;
+        ok = std::fflush(fh) == 0 && ok && !ferror(fh);
+        std::fclose(fh);
+        if (!ok || rename(tmp.c_str(), file.c_str()) != 0) {
+            err = errno_str("write " + file);
+            unlink(tmp.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    // Load the TSV; on first run seed with last year's group A (dummy values
+    // from the score_function scripts) so the board shows something real.
+    void load_or_seed(MessageQueue &msgs) {
+        std::lock_guard<std::mutex> lk(m);
+        FILE *fh = std::fopen(file.c_str(), "r");
+        if (fh) {
+            char line[256];
+            while (std::fgets(line, sizeof line, fh)) {
+                std::string s(line);
+                while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+                    s.pop_back();
+                if (s.compare(0, 5, "team\t") == 0) {
+                    std::string nm = sanitize_name(s.substr(5));
+                    if (teams.size() < kMaxTeams) // placeholder keeps indices stable
+                        teams.push_back(nm.empty()
+                                            ? "Team " + std::to_string(teams.size() + 1)
+                                            : nm);
+                } else if (s.compare(0, 6, "match\t") == 0) {
+                    int w = -1, l = -1;
+                    if (std::sscanf(s.c_str() + 6, "%d\t%d", &w, &l) == 2 &&
+                        w >= 0 && l >= 0 && w != l &&
+                        w < (int)teams.size() && l < (int)teams.size())
+                        matches.emplace_back(w, l);
+                }
+            }
+            std::fclose(fh);
+            msgs.push("scoreboard: " + std::to_string(teams.size()) + " teams, " +
+                      std::to_string(matches.size()) + " matches from " + file);
+            return;
+        }
+        static const int demo[9][9] = {
+            {0, 0, 1, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 0, 1},
+            {0, 0, 0, 1, 1, 0, 1, 1, 0}, {0, 0, 0, 0, 0, 0, 0, 0, 1},
+            {0, 0, 0, 1, 0, 0, 0, 0, 0}, {0, 0, 1, 1, 0, 0, 1, 0, 1},
+            {0, 0, 0, 1, 0, 0, 0, 0, 0}, {0, 0, 0, 1, 0, 0, 0, 0, 0},
+            {0, 0, 0, 0, 0, 0, 0, 0, 0}};
+        for (int i = 0; i < 9; i++)
+            teams.push_back("Team " + std::to_string(i + 1));
+        for (int i = 0; i < 9; i++)
+            for (int j = 0; j < 9; j++)
+                if (demo[i][j]) matches.emplace_back(i, j);
+        std::string err;
+        if (!save_locked(err)) msgs.push("scoreboard: " + err);
+        msgs.push("scoreboard: seeded demo tournament (last year's group A) -> " + file);
+    }
+
+    void recompute_locked() {
+        cache.clear();
+        cache_err.clear();
+        const size_t n = teams.size();
+        if (n == 0) return;
+        std::vector<double> M(n * n, 0.0); // M[i][j] = wins of i over j
+        for (const auto &mt : matches) M[mt.first * n + mt.second] += 1.0;
+        std::string in = std::to_string(n);
+        char num[32];
+        for (size_t i = 0; i < n * n; i++) {
+            std::snprintf(num, sizeof num, " %g", M[i]);
+            in += num;
+        }
+        in += "\n";
+        std::string out, err;
+        if (!run_script(script, in, out, err, 30000)) { cache_err = err; return; }
+        const char *p = out.c_str();
+        char *end;
+        for (size_t i = 0; i < n; i++) {
+            double v = strtod(p, &end);
+            if (end == p) {
+                cache_err = "unexpected score script output";
+                cache.clear();
+                return;
+            }
+            cache.push_back(v);
+            p = end;
+        }
+    }
+
+    std::string scores_json() {
+        std::lock_guard<std::mutex> lk(m);
+        if (cache.size() != teams.size()) recompute_locked();
+        if (!cache_err.empty()) {
+            std::string j = "{\"ok\":false,\"error\":\"";
+            json_escape(j, cache_err);
+            return j + "\"}";
+        }
+        const size_t n = teams.size();
+        std::vector<int> wins(n, 0), losses(n, 0);
+        for (const auto &mt : matches) { wins[mt.first]++; losses[mt.second]++; }
+        std::vector<size_t> order(n);
+        for (size_t i = 0; i < n; i++) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            if (cache[a] != cache[b]) return cache[a] > cache[b];
+            return teams[a] < teams[b];
+        });
+        std::string j = "{\"ok\":true,\"algorithm\":\"pagerank_bias\",\"matches\":" +
+                        std::to_string(matches.size()) + ",\"teams\":[";
+        char buf[128];
+        for (size_t k = 0; k < n; k++) {
+            size_t i = order[k];
+            if (k) j += ',';
+            j += "{\"name\":\"";
+            json_escape(j, teams[i]);
+            std::snprintf(buf, sizeof buf,
+                          "\",\"score\":%.6f,\"wins\":%d,\"losses\":%d}",
+                          cache[i], wins[i], losses[i]);
+            j += buf;
+        }
+        return j + "]}";
+    }
+
+    bool add_match(const std::string &w_raw, const std::string &l_raw,
+                   std::string &err) {
+        std::string w = sanitize_name(w_raw), l = sanitize_name(l_raw);
+        if (w.empty() || l.empty()) { err = "winner and loser must both be named"; return false; }
+        if (w == l) { err = "winner and loser are the same team"; return false; }
+        std::lock_guard<std::mutex> lk(m);
+        int wi = find_or_add_locked(w), li = find_or_add_locked(l);
+        if (wi < 0 || li < 0) {
+            err = "too many teams (max " + std::to_string(kMaxTeams) + ")";
+            return false;
+        }
+        matches.emplace_back(wi, li);
+        cache.clear();
+        return save_locked(err);
+    }
+
+    bool undo(std::string &err) {
+        std::lock_guard<std::mutex> lk(m);
+        if (matches.empty()) { err = "no matches to undo"; return false; }
+        matches.pop_back(); // teams stay on the roster
+        cache.clear();
+        return save_locked(err);
+    }
+};
+
 // -------------------------------------------------------------- web server
 // Live view + remote VAR control. One listener thread accepts connections;
 // each client gets a detached handler thread. Live frames go out as
@@ -898,6 +1184,17 @@ footer{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;padding:14px}
 button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:12px 20px;cursor:pointer;background:#1c2530;color:#dfe6ee}
 button:disabled{opacity:.4;cursor:default}
 #save{background:#b3261e;color:#fff}
+#board{max-width:720px;margin:0 auto;padding:0 14px 8px;width:100%;box-sizing:border-box}
+#board h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase}
+#board table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+#board th,#board td{text-align:left;padding:6px 8px;border-bottom:1px solid #1c2530}
+#board th{color:#5c6672;font-size:12px}
+#board td:first-child,#board th:first-child{width:2em;color:#5c6672}
+#board td:nth-child(n+3),#board th:nth-child(n+3){text-align:right}
+#af{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+#af input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;min-width:8em;flex:1}
+#af button{padding:9px 14px}
+#serr{color:#e57373;font-size:13px;min-height:1.2em;margin-top:6px}
 kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 #help{text-align:center;color:#5c6672;font-size:12px;padding-bottom:12px}
 </style>
@@ -908,6 +1205,19 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button id="again" disabled>&#8635; Replay last</button>
 <button id="live">&#9679; Live</button>
 </footer>
+<section id="board">
+<h2>Tournament &middot; bias PageRank</h2>
+<table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
+<form id="af">
+<input id="win" list="tlist" placeholder="winner" maxlength="40" required autocomplete="off">
+<span>beat</span>
+<input id="los" list="tlist" placeholder="loser" maxlength="40" required autocomplete="off">
+<datalist id="tlist"></datalist>
+<button type="submit">Add result</button>
+<button type="button" id="undo">Undo</button>
+</form>
+<div id="serr"></div>
+</section>
 <div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
 <script>
 const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');
@@ -920,7 +1230,8 @@ $('save').onclick=async()=>{$('save').disabled=true;
   catch(e){}finally{$('save').disabled=false;}};
 $('again').onclick=()=>{if(replayFrames)replay(replayFrames/playFps);};
 $('live').onclick=live;cam.onclick=live;
-addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();$('save').click();}
+addEventListener('keydown',e=>{if(e.target&&e.target.tagName==='INPUT')return;
+  if(e.code==='Space'){e.preventDefault();$('save').click();}
   else if(e.key==='r')$('again').click();else if(e.key==='l'||e.key==='Escape')live();});
 cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
 (async function poll(){try{const s=await(await fetch('/status')).json();
@@ -928,6 +1239,24 @@ cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
   $('again').disabled=!replayFrames;
   st.textContent=s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'% · drops '+s.drops+(s.save_busy?' · saving…':'');
 }catch(e){st.textContent='⚠ connection lost';}setTimeout(poll,1000);})();
+async function scores(){try{const s=await(await fetch('/scores')).json();
+ if(!s.ok){$('serr').textContent=s.error;return;}
+ $('serr').textContent='';
+ const tb=$('tb'),dl=$('tlist');tb.innerHTML='';dl.innerHTML='';
+ s.teams.forEach((t,i)=>{const tr=document.createElement('tr');
+  [i+1,t.name,(t.score*100).toFixed(2),t.wins,t.losses].forEach(v=>{
+   const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});
+  tb.appendChild(tr);
+  const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
+}catch(e){}}
+$('af').addEventListener('submit',async e=>{e.preventDefault();
+ try{const r=await(await fetch('/scores/add?winner='+encodeURIComponent($('win').value)
+  +'&loser='+encodeURIComponent($('los').value),{method:'POST'})).json();
+ if(!r.ok){$('serr').textContent=r.error;return;}
+ $('win').value='';$('los').value='';scores();}catch(e){}});
+$('undo').onclick=async()=>{try{const r=await(await fetch('/scores/undo',{method:'POST'})).json();
+ if(!r.ok)$('serr').textContent=r.error;else scores();}catch(e){}};
+scores();setInterval(scores,10000);
 </script>
 )HTML";
 
@@ -1026,6 +1355,39 @@ static int query_int(const std::string &path, const char *key, int fallback) {
         pos = amp + 1;
     }
     return fallback;
+}
+
+static std::string percent_decode(const std::string &s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '+') out += ' ';
+        else if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) &&
+                 isxdigit((unsigned char)s[i + 2])) {
+            char hex[3] = {s[i + 1], s[i + 2], 0};
+            out += (char)strtol(hex, nullptr, 16);
+            i += 2;
+        } else out += s[i];
+    }
+    return out;
+}
+
+// value of ?key=... (percent-decoded), or "" if absent
+static std::string query_str(const std::string &path, const char *key) {
+    size_t q = path.find('?');
+    if (q == std::string::npos) return "";
+    std::string qs = path.substr(q + 1);
+    std::string want = std::string(key) + "=";
+    size_t pos = 0;
+    while (pos < qs.size()) {
+        size_t amp = qs.find('&', pos);
+        std::string kv = qs.substr(pos, amp == std::string::npos ? std::string::npos
+                                                                 : amp - pos);
+        if (kv.compare(0, want.size(), want) == 0)
+            return percent_decode(kv.substr(want.size()));
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return "";
 }
 
 static const char *kMjpegHeader =
@@ -1127,6 +1489,47 @@ static void handle_status(int fd, const Cfg &cfg, Shared *sh) {
     send_simple(fd, sh, "200 OK", "application/json", body);
 }
 
+static void scores_error(int fd, Shared *sh, const char *status,
+                         const std::string &err) {
+    std::string body = "{\"ok\":false,\"error\":\"";
+    json_escape(body, err);
+    send_simple(fd, sh, status, "application/json", body + "\"}");
+}
+
+static void handle_scores(int fd, Shared *sh) {
+    if (!sh->scores) {
+        scores_error(fd, sh, "503 Service Unavailable", "scoreboard disabled");
+        return;
+    }
+    send_simple(fd, sh, "200 OK", "application/json", sh->scores->scores_json());
+}
+
+static void handle_scores_add(int fd, Shared *sh, const std::string &path) {
+    if (!sh->scores) {
+        scores_error(fd, sh, "503 Service Unavailable", "scoreboard disabled");
+        return;
+    }
+    std::string err;
+    if (!sh->scores->add_match(query_str(path, "winner"), query_str(path, "loser"), err)) {
+        scores_error(fd, sh, "400 Bad Request", err);
+        return;
+    }
+    send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
+}
+
+static void handle_scores_undo(int fd, Shared *sh) {
+    if (!sh->scores) {
+        scores_error(fd, sh, "503 Service Unavailable", "scoreboard disabled");
+        return;
+    }
+    std::string err;
+    if (!sh->scores->undo(err)) {
+        scores_error(fd, sh, "400 Bad Request", err);
+        return;
+    }
+    send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
+}
+
 static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     timeval tv{5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -1147,6 +1550,12 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_save(fd, cfg, sh);
         else if (method == "GET" && route == "/status")
             handle_status(fd, cfg, sh);
+        else if (method == "GET" && route == "/scores")
+            handle_scores(fd, sh);
+        else if (method == "POST" && route == "/scores/add")
+            handle_scores_add(fd, sh, path);
+        else if (method == "POST" && route == "/scores/undo")
+            handle_scores_undo(fd, sh);
         else if (method == "GET" && route == "/favicon.ico")
             send_str(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", sh);
         else
@@ -1407,7 +1816,20 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "warning: ffplay not found — saving will work but "
                              "replay will not (sudo apt install ffmpeg)\n");
 
+    ScoreBoard scores; // declared before sh: outlives the web client threads
     Shared sh(cfg.max_frames(), (size_t)cfg.capture_fps);
+    if (!cfg.no_scores && cfg.http_port > 0 && cfg.selftest == 0) {
+        if (access(cfg.scores_script.c_str(), F_OK) != 0) {
+            std::fprintf(stderr, "warning: score script not found (%s) — "
+                                 "scoreboard disabled (--scores-script PATH)\n",
+                         cfg.scores_script.c_str());
+        } else {
+            scores.script = cfg.scores_script;
+            scores.file = cfg.scores_file;
+            scores.load_or_seed(sh.msgs);
+            sh.scores = &scores;
+        }
+    }
     std::thread cap(cfg.mjpeg_file.empty() ? v4l2_capture_thread
                                            : file_capture_thread,
                     cfg, &sh);

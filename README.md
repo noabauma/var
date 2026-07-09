@@ -67,6 +67,31 @@ rate), `GET /replay` (last clip from RAM, loops), `POST /save` (trigger a
 save, returns JSON), `GET /status` (JSON). No authentication — trusted
 LAN/tunnel only.
 
+## Tournament scoreboard (bias PageRank)
+
+The web page also shows the **current tournament ranking**, computed with
+the *bias* score function in
+`score_function/page_rank_billiardino_algorithm_bias.py` — that Python file
+stays the single source of truth: the recorder calls it through
+`score_function/compute_scores.py`, so tweaking the algorithm immediately
+changes the live board. (`recursive_deletion` is deliberately not applied:
+it disqualifies the least-connected teams, which is wrong mid-tournament;
+the participation bias already compensates for uneven game counts.)
+
+Enter results directly on the page: type **winner** / **loser** (existing
+teams autocomplete; new names create new teams) and press **Add result**.
+**Undo** removes the last entered match. Everything persists in a plain
+TSV file (default `~/recordings/tournament.tsv`).
+
+- First run seeds the board with **last year's group A dummy matrix** so you
+  can see it working. To start the real tournament fresh, empty the file:
+  `: > ~/recordings/tournament.tsv` and restart (deleting it instead would
+  re-seed the demo).
+- Endpoints: `GET /scores` (rankings as JSON),
+  `POST /scores/add?winner=X&loser=Y`, `POST /scores/undo`.
+- Options: `--scores-file PATH`, `--scores-script PATH`, `--no-scores`.
+- Needs `python3` + `numpy` (already on the Pi).
+
 **Headless / kiosk use:** without a terminal the program keeps recording and
 serves the web controls (`nohup ./slowmo_cam >/tmp/slowmo.log 2>&1 &`).
 
@@ -133,6 +158,9 @@ ffmpeg -i slowmo_x.avi -c:v libx264 -crf 20 slowmo_x_small.mp4
 --mjpeg-file PATH    test input: raw .mjpeg stream file instead of a camera
 --port N             web live view + control port (default 8080, 0 = off)
 --http-fps N         live-stream rate served to browsers (default 30)
+--scores-script PATH python bridge for the scoreboard
+--scores-file PATH   tournament state (default <out-dir>/tournament.tsv)
+--no-scores          disable the web scoreboard
 ```
 
 ## Self-test

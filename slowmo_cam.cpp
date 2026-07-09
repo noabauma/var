@@ -35,7 +35,10 @@
 //   ./slowmo_cam --selftest 3      # capture 3 s, auto-save, verify, exit
 //   ./slowmo_cam --help            # all options
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -900,6 +903,12 @@ button:disabled{opacity:.4;cursor:default}
 #save{background:#b3261e;color:#fff}
 kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 #help{text-align:center;color:#5c6672;font-size:12px;padding-bottom:12px}
+details#tbl{width:100%;max-width:1280px;margin:0 auto 12px;box-sizing:border-box;padding:0 10px}
+summary{cursor:pointer;list-style:none;padding:11px 16px;background:#141b24;border-radius:10px;font-weight:600;user-select:none}
+summary::-webkit-details-marker{display:none}
+summary::before{content:'\25B8\00a0';color:#8b96a5}
+details[open] summary::before{content:'\25BE\00a0'}
+#tblbody{overflow-x:auto;padding:8px 4px}
 </style>
 <header><h1>slowmo-cam</h1><span id="st">connecting&hellip;</span></header>
 <main><div id="wrap"><img id="cam" src="/stream" alt="live"><div id="badge" hidden>REPLAY</div></div></main>
@@ -908,6 +917,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button id="again" disabled>&#8635; Replay last</button>
 <button id="live">&#9679; Live</button>
 </footer>
+<details id="tbl"><summary>&#127942; Standings</summary><div id="tblbody">loading&hellip;</div></details>
 <div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
 <script>
 const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');
@@ -923,6 +933,10 @@ $('live').onclick=live;cam.onclick=live;
 addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();$('save').click();}
   else if(e.key==='r')$('again').click();else if(e.key==='l'||e.key==='Escape')live();});
 cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
+$('tbl').addEventListener('toggle',async function(){
+  if(this.open&&!this.dataset.loaded){this.dataset.loaded=1;
+    try{$('tblbody').innerHTML=await(await fetch('/standings')).text();}
+    catch(e){$('tblbody').textContent='⚠ could not load standings';this.dataset.loaded='';}}});
 (async function poll(){try{const s=await(await fetch('/status')).json();
   replayFrames=s.replay_frames;playFps=s.playback_fps;slow=Math.round(s.capture_fps/s.playback_fps);
   $('again').disabled=!replayFrames;
@@ -1127,6 +1141,229 @@ static void handle_status(int fd, const Cfg &cfg, Shared *sh) {
     send_simple(fd, sh, "200 OK", "application/json", body);
 }
 
+// ---- Tournament standings -------------------------------------------------
+// Ports score_function/page_rank_billiardino_algorithm{,_bias}.py to C++ so
+// the recorder can serve the same board it prints. M[i][j] is the number of
+// times team i beat team j, so row i sums to team i's total wins. The group
+// matrices below are the tables from those scripts — edit them (and rebuild)
+// to update the board shown at /standings.
+
+static const char *kTeamNames[9] =
+    {"T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"};
+
+static const int kGroupA[9][9] = {
+    {0, 0, 1, 1, 1, 1, 1, 1, 1},
+    {1, 0, 1, 1, 1, 1, 0, 0, 1},
+    {0, 0, 0, 1, 1, 0, 1, 1, 0},
+    {0, 0, 0, 0, 0, 0, 0, 0, 1},
+    {0, 0, 0, 1, 0, 0, 0, 0, 0},
+    {0, 0, 1, 1, 0, 0, 1, 0, 1},
+    {0, 0, 0, 1, 0, 0, 0, 0, 0},
+    {0, 0, 0, 1, 0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0}};
+static const int kGroupB[9][9] = {
+    {0, 0, 0, 0, 0, 0, 1, 1, 0},
+    {1, 0, 1, 1, 0, 0, 0, 1, 0},
+    {1, 0, 0, 0, 0, 0, 0, 0, 0},
+    {1, 0, 1, 0, 0, 0, 1, 1, 0},
+    {0, 1, 1, 1, 0, 0, 1, 1, 1},
+    {1, 1, 1, 0, 1, 0, 1, 1, 1},
+    {0, 1, 1, 0, 0, 0, 0, 1, 0},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0, 0, 1, 0, 0}};
+
+typedef std::array<std::array<double, 9>, 9> Mat9;
+
+static Mat9 to_mat(const int (*M)[9]) {
+    Mat9 out;
+    for (int i = 0; i < 9; i++)
+        for (int j = 0; j < 9; j++) out[i][j] = M[i][j];
+    return out;
+}
+
+// recursive_deletion(): disqualify the least-played teams (zeroing their row
+// and column) for up to n_steps rounds, mirroring the Python version.
+static void recursive_deletion(Mat9 &M, int n_steps) {
+    int disqualified = 0;
+    for (int step = 0; step < n_steps; step++) {
+        double games[9], mx = -1;
+        for (int k = 0; k < 9; k++) {
+            double col = 0, row = 0;
+            for (int i = 0; i < 9; i++) col += M[i][k];
+            for (int j = 0; j < 9; j++) row += M[k][j];
+            games[k] = row + col;
+            if (games[k] > mx) mx = games[k];
+        }
+        bool all_max = true;
+        for (int k = 0; k < 9; k++) if (games[k] != mx) { all_max = false; break; }
+        if (all_max) {
+            if (mx == (double)(9 - disqualified)) break; // fully connected
+            else continue;
+        }
+        for (int k = 0; k < 9; k++) if (games[k] == 0) games[k] = 9 + 1;
+        double minv = games[0];
+        for (int k = 1; k < 9; k++) if (games[k] < minv) minv = games[k];
+        for (int idx = 0; idx < 9; idx++)
+            if (games[idx] == minv) {
+                disqualified++;
+                for (int i = 0; i < 9; i++) { M[i][idx] = 0; M[idx][i] = 0; }
+            }
+    }
+}
+
+// pagerank(): d = damping. bias=false uses the uniform (1-d)/N teleport
+// (page_rank_billiardino_algorithm.py); bias=true weights the teleport by
+// games played (page_rank_billiardino_algorithm_bias.py).
+static std::array<double, 9> pagerank(Mat9 M, double d, bool bias) {
+    double p[9];
+    if (bias) {
+        double games[9], total = 0;
+        for (int k = 0; k < 9; k++) {
+            double col = 0, row = 0;
+            for (int i = 0; i < 9; i++) col += M[i][k];
+            for (int j = 0; j < 9; j++) row += M[k][j];
+            games[k] = row + col;
+            total += games[k];
+        }
+        for (int k = 0; k < 9; k++) p[k] = total > 0 ? games[k] / total : 1.0 / 9;
+    } else {
+        for (int k = 0; k < 9; k++) p[k] = 1.0 / 9;
+    }
+    double col_sum[9];
+    for (int j = 0; j < 9; j++) {
+        col_sum[j] = 0;
+        for (int i = 0; i < 9; i++) col_sum[j] += M[i][j];
+        if (col_sum[j] == 0) col_sum[j] = 1;
+    }
+    for (int i = 0; i < 9; i++)
+        for (int j = 0; j < 9; j++) M[i][j] /= col_sum[j];
+
+    double w[9], v[9];
+    for (int i = 0; i < 9; i++) w[i] = 1.0 / 9;
+    auto iterate = [&](const double *win, double *vout) {
+        for (int i = 0; i < 9; i++) {
+            double s = 0;
+            for (int j = 0; j < 9; j++) s += d * M[i][j] * win[j];
+            vout[i] = s + (1 - d) * p[i];
+        }
+    };
+    iterate(w, v);
+    for (;;) {
+        double nrm = 0;
+        for (int i = 0; i < 9; i++) nrm += (w[i] - v[i]) * (w[i] - v[i]);
+        if (std::sqrt(nrm) < 1e-10) break;
+        for (int i = 0; i < 9; i++) w[i] = v[i];
+        iterate(w, v);
+    }
+    std::array<double, 9> out;
+    for (int i = 0; i < 9; i++) out[i] = v[i];
+    return out;
+}
+
+static std::string fmt4(double x) {
+    char b[16];
+    std::snprintf(b, sizeof b, "%.4f", x);
+    return b;
+}
+
+// Ranking table: teams ordered by PageRank (bias) score, showing both the
+// bias and uniform scores plus each team's total wins.
+static std::string build_rank_table(const char *title, const int (*M)[9],
+                                     int deletion_steps) {
+    int wins[9] = {0};
+    for (int i = 0; i < 9; i++)
+        for (int j = 0; j < 9; j++) wins[i] += M[i][j];
+
+    Mat9 reduced = to_mat(M);
+    recursive_deletion(reduced, deletion_steps);
+    std::array<double, 9> uni = pagerank(reduced, 0.85, false);
+    std::array<double, 9> bia = pagerank(reduced, 0.85, true);
+
+    int order[9];
+    for (int i = 0; i < 9; i++) order[i] = i;
+    std::stable_sort(order, order + 9,
+                     [&](int a, int b) { return bia[a] > bia[b]; });
+    double bmax = bia[order[0]] > 0 ? bia[order[0]] : 1;
+
+    std::string h = "<h2>" + std::string(title) + "</h2>\n";
+    h += "<table><thead><tr><th>#</th><th>team</th><th>wins</th>"
+         "<th>PageRank<br><span class=\"sub\">bias</span></th>"
+         "<th>PageRank<br><span class=\"sub\">uniform</span></th></tr>"
+         "</thead><tbody>";
+    for (int r = 0; r < 9; r++) {
+        int t = order[r];
+        int pct = (int)(100.0 * bia[t] / bmax + 0.5);
+        h += "<tr><td class=\"rk\">" + std::to_string(r + 1) + "</td>";
+        h += "<th>" + std::string(kTeamNames[t]) + "</th>";
+        h += "<td>" + std::to_string(wins[t]) + "</td>";
+        h += "<td class=\"score\"><span class=\"bar\" style=\"width:" +
+             std::to_string(pct) + "%\"></span><span class=\"num\">" +
+             fmt4(bia[t]) + "</span></td>";
+        h += "<td class=\"uni\">" + fmt4(uni[t]) + "</td></tr>";
+    }
+    h += "</tbody></table>\n";
+    return h;
+}
+
+static std::string build_win_table(const char *title, const int (*M)[9]) {
+    std::string h = "<h2>" + std::string(title) + "</h2>\n";
+    h += "<table><thead><tr><th class=\"corner\">won&#8201;\\&#8201;lost</th>";
+    for (int j = 0; j < 9; j++) h += "<th>" + std::string(kTeamNames[j]) + "</th>";
+    h += "<th class=\"tot\">won</th></tr></thead><tbody>";
+    for (int i = 0; i < 9; i++) {
+        int row_sum = 0;
+        h += "<tr><th>" + std::string(kTeamNames[i]) + "</th>";
+        for (int j = 0; j < 9; j++) {
+            int v = M[i][j];
+            row_sum += v;
+            if (i == j)   h += "<td class=\"diag\">&middot;</td>";
+            else if (v)   h += "<td class=\"w\">" + std::to_string(v) + "</td>";
+            else          h += "<td class=\"z\">0</td>";
+        }
+        h += "<td class=\"tot\">" + std::to_string(row_sum) + "</td></tr>";
+    }
+    h += "</tbody></table>\n";
+    return h;
+}
+
+static std::string build_standings_html() {
+    std::string h =
+        "<style>"
+        "#tblbody h2{font-size:14px;margin:16px 0 6px;color:#dfe6ee}"
+        "#tblbody h3{font-size:15px;margin:22px 0 2px;color:#fff}"
+        "#tblbody table{border-collapse:collapse;margin:0 0 14px;"
+        "font-variant-numeric:tabular-nums;font-size:14px}"
+        "#tblbody th,#tblbody td{border:1px solid #263041;padding:5px 9px;"
+        "text-align:center;min-width:28px}"
+        "#tblbody thead th{background:#141b24;color:#aeb9c7;font-weight:600}"
+        "#tblbody tbody th{background:#141b24;color:#aeb9c7;font-weight:600}"
+        "#tblbody td.w{color:#9fe0a6;font-weight:600}"
+        "#tblbody td.z{color:#4a5563}"
+        "#tblbody td.diag{background:#0f151c;color:#39434f}"
+        "#tblbody .tot{background:#1c2530;color:#fff;font-weight:700}"
+        "#tblbody td.rk{color:#8b96a5}"
+        "#tblbody td.uni{color:#8b96a5}"
+        "#tblbody .sub{font-weight:400;font-size:11px;color:#6b7684}"
+        "#tblbody td.score{position:relative;text-align:right;min-width:96px}"
+        "#tblbody td.score .bar{position:absolute;left:0;top:0;bottom:0;"
+        "background:#1f6f34;opacity:.45;z-index:0}"
+        "#tblbody td.score .num{position:relative;z-index:1;color:#cfeecf;"
+        "font-weight:600}"
+        "#tblbody p.leg{color:#6b7684;font-size:12px;margin:2px 0 10px}"
+        "</style>"
+        "<p class=\"leg\">Ranking is by PageRank on the reduced graph (least-played "
+        "teams disqualified first), highest first; both the participation-biased "
+        "and uniform scores are shown. The vs&nbsp;table below gives the raw "
+        "head-to-head wins (row beat column).</p>";
+    h += "<h3>Group A</h3>";
+    h += build_rank_table("Ranking (PageRank)", kGroupA, 2);
+    h += build_win_table("Head-to-head wins", kGroupA);
+    h += "<h3>Group B</h3>";
+    h += build_rank_table("Ranking (PageRank)", kGroupB, 1);
+    h += build_win_table("Head-to-head wins", kGroupB);
+    return h;
+}
+
 static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     timeval tv{5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -1147,6 +1384,9 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_save(fd, cfg, sh);
         else if (method == "GET" && route == "/status")
             handle_status(fd, cfg, sh);
+        else if (method == "GET" && route == "/standings")
+            send_simple(fd, sh, "200 OK", "text/html; charset=utf-8",
+                        build_standings_html());
         else if (method == "GET" && route == "/favicon.ico")
             send_str(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", sh);
         else

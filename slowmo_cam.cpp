@@ -67,6 +67,39 @@
 #include <unistd.h>
 #include <linux/videodev2.h>
 
+// ----------------------------------------------------------------- profiling
+// TraCR instrumentation (~/src/tracr) — compiled in only via `make tracr`
+// (-DENABLE_TRACR); the regular build uses the no-op stubs below, so there is
+// zero overhead and no dependency on the TraCR headers.
+#ifdef ENABLE_TRACR
+#include <tracr/tracr.hpp>
+#else
+#define INSTRUMENTATION_START()
+#define INSTRUMENTATION_END()
+#define INSTRUMENTATION_THREAD_INIT()
+#define INSTRUMENTATION_THREAD_FINALIZE()
+#define INSTRUMENTATION_MARK_ADD(label) 0
+#define INSTRUMENTATION_MARK_SET(ch, ev, extra) (void)0
+#define INSTRUMENTATION_MARK_RESET(ch) (void)0
+#define INSTRUMENTATION_ADD_NUM_CHANNELS(n) (void)0
+#define INSTRUMENTATION_TRACE_PATH(p) (void)0
+#endif
+
+// visualization lanes: 0 = camera capture, 1 = clip saver, 2.. = web clients
+// (client threads round-robin over TR_WEB_LANES lanes)
+enum { TR_CH_CAPTURE = 0, TR_CH_SAVER = 1, TR_CH_WEB0 = 2, TR_WEB_LANES = 4 };
+static struct {
+    uint16_t frame_ingest, avi_write, prune, http_req, stream_send, scores_py;
+} g_tr;
+static std::atomic<int> g_tr_web_seq{0};
+static thread_local int g_tr_ch = TR_CH_WEB0;
+
+// registers/deregisters the calling thread with TraCR on every exit path
+struct TrThreadGuard {
+    TrThreadGuard() { INSTRUMENTATION_THREAD_INIT(); }
+    ~TrThreadGuard() { INSTRUMENTATION_THREAD_FINALIZE(); }
+};
+
 // ------------------------------------------------------------------ utils
 
 static volatile sig_atomic_t g_stop = 0;
@@ -695,12 +728,15 @@ static void prune_clips(const Cfg &cfg, Shared *sh) {
 
 static void saver_thread(std::shared_ptr<const Snapshot> snap, Cfg cfg,
                          Shared *sh, std::string path) {
+    TrThreadGuard tr_guard;
     double t0 = now_mono();
     std::string err;
     uint64_t bytes = 0;
     for (const auto &f : *snap) bytes += f->size();
+    INSTRUMENTATION_MARK_SET(TR_CH_SAVER, g_tr.avi_write, (uint32_t)snap->size());
     bool ok = avi::write_mjpg(path, *snap, cfg.width, cfg.height,
                               cfg.playback_fps, err);
+    INSTRUMENTATION_MARK_RESET(TR_CH_SAVER);
     double dt = now_mono() - t0;
     char msg[512];
     if (ok) {
@@ -715,7 +751,11 @@ static void saver_thread(std::shared_ptr<const Snapshot> snap, Cfg cfg,
         std::snprintf(msg, sizeof msg, "save FAILED: %s", err.c_str());
     }
     sh->msgs.push(msg);
-    if (ok) prune_clips(cfg, sh);
+    if (ok) {
+        INSTRUMENTATION_MARK_SET(TR_CH_SAVER, g_tr.prune, 0);
+        prune_clips(cfg, sh);
+        INSTRUMENTATION_MARK_RESET(TR_CH_SAVER);
+    }
     sh->save_busy = false;
 }
 
@@ -749,6 +789,7 @@ static std::shared_ptr<const Snapshot> save_now(const Cfg &cfg, Shared &sh,
 // ---------------------------------------------------------- V4L2 capture
 
 static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
+    TrThreadGuard tr_guard;
     int fd = open(cfg.device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) { sh->set_error(errno_str("open " + cfg.device)); return; }
 
@@ -850,6 +891,9 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
             break;
         }
         const uint8_t *d = (const uint8_t *)bufs[b.index].ptr;
+        // per-frame cost from dequeue to requeue (extraId = frame KB)
+        INSTRUMENTATION_MARK_SET(TR_CH_CAPTURE, g_tr.frame_ingest,
+                                 b.bytesused >> 10);
         // skip broken frames some UVC cams emit right after stream start
         if (b.bytesused > 4 && d[0] == 0xFF && d[1] == 0xD8) {
             sh->ring.push(std::make_shared<FrameData>(d, d + b.bytesused));
@@ -858,7 +902,9 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
             expected_seq = b.sequence + 1;
             have_seq = true;
         }
-        if (xioctl(fd, VIDIOC_QBUF, &b) != 0) {
+        bool qbuf_ok = xioctl(fd, VIDIOC_QBUF, &b) == 0;
+        INSTRUMENTATION_MARK_RESET(TR_CH_CAPTURE);
+        if (!qbuf_ok) {
             sh->set_error(errno_str("VIDIOC_QBUF"));
             break;
         }
@@ -873,6 +919,7 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
 // -------------------------------------------- test capture from .mjpeg file
 
 static void file_capture_thread(Cfg cfg, Shared *sh) {
+    TrThreadGuard tr_guard;
     FILE *fh = std::fopen(cfg.mjpeg_file.c_str(), "rb");
     if (!fh) { sh->set_error(errno_str("open " + cfg.mjpeg_file)); return; }
     std::vector<uint8_t> data;
@@ -1244,7 +1291,10 @@ struct ScoreBoard {
         }
         in += "\n";
         std::string out, err;
-        if (!run_script(script, in, out, err, 30000)) { cache_err = err; return; }
+        INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.scores_py, (uint32_t)n);
+        bool script_ok = run_script(script, in, out, err, 30000);
+        INSTRUMENTATION_MARK_RESET(g_tr_ch);
+        if (!script_ok) { cache_err = err; return; }
         const char *p = out.c_str();
         char *end;
         for (size_t i = 0; i < 2 * n; i++) { // line 1 bias, line 2 classic
@@ -1844,7 +1894,11 @@ static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
         }
         Frame f = sh->ring.latest();
         if (!f) { next = t + 0.1; continue; }
-        if (!send_part(fd, *f, sh)) return;
+        INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.stream_send,
+                                 (uint32_t)(f->size() >> 10));
+        bool sent = send_part(fd, *f, sh);
+        INSTRUMENTATION_MARK_RESET(g_tr_ch);
+        if (!sent) return;
         next += period;
         if (next < t - 1.0) next = t; // stalled client came back: no burst
     }
@@ -1870,7 +1924,11 @@ static void handle_replay(int fd, const Cfg &cfg, Shared *sh) {
             poll(nullptr, 0, ms > 100 ? 100 : (ms < 1 ? 1 : ms));
             continue;
         }
-        if (!send_part(fd, *(*snap)[i], sh)) return;
+        INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.stream_send,
+                                 (uint32_t)((*snap)[i]->size() >> 10));
+        bool sent = send_part(fd, *(*snap)[i], sh);
+        INSTRUMENTATION_MARK_RESET(g_tr_ch);
+        if (!sent) return;
         i = (i + 1) % snap->size();
         next += period;
         if (next < t - 1.0) next = t;
@@ -1978,6 +2036,8 @@ static void scores_mutation(int fd, Shared *sh, bool ok, const std::string &err)
 }
 
 static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
+    TrThreadGuard tr_guard;
+    g_tr_ch = TR_CH_WEB0 + (g_tr_web_seq++ % TR_WEB_LANES);
     timeval tv{5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -1987,6 +2047,10 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     std::string method, path;
     if (read_request(fd, method, path)) {
         std::string route = path.substr(0, path.find('?'));
+        // one event per short request; the long-lived streams instrument
+        // their per-frame sends instead
+        bool traced = !(route == "/stream" || route == "/replay");
+        if (traced) INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.http_req, 0);
         if (method == "GET" && (route == "/" || route == "/index.html"))
             send_simple(fd, sh, "200 OK", "text/html; charset=utf-8", kHtmlPage);
         else if (method == "GET" && route == "/stream")
@@ -2028,6 +2092,7 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             send_str(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", sh);
         else
             send_simple(fd, sh, "404 Not Found", "text/plain", "not found\n");
+        if (traced) INSTRUMENTATION_MARK_RESET(g_tr_ch);
     }
     st->client_done(fd); // deregister first, then close (avoids fd-reuse race)
     close(fd);
@@ -2053,6 +2118,7 @@ static std::string lan_ip() {
 }
 
 static void http_server_thread(Cfg cfg, Shared *sh, HttpState *st) {
+    TrThreadGuard tr_guard;
     int lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (lfd < 0) { sh->msgs.push(errno_str("web: socket")); return; }
     int one = 1;
@@ -2271,6 +2337,15 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
+    INSTRUMENTATION_TRACE_PATH("./tracr/");
+    INSTRUMENTATION_START();
+    g_tr.frame_ingest = INSTRUMENTATION_MARK_ADD("frame_ingest");
+    g_tr.avi_write = INSTRUMENTATION_MARK_ADD("avi_write");
+    g_tr.prune = INSTRUMENTATION_MARK_ADD("prune_clips");
+    g_tr.http_req = INSTRUMENTATION_MARK_ADD("http_request");
+    g_tr.stream_send = INSTRUMENTATION_MARK_ADD("stream_frame_send");
+    g_tr.scores_py = INSTRUMENTATION_MARK_ADD("scores_python");
+
     if (cfg.mjpeg_file.empty() && access(cfg.device.c_str(), F_OK) != 0) {
         std::fprintf(stderr, "%s not found — is the camera plugged in?\n",
                      cfg.device.c_str());
@@ -2325,6 +2400,8 @@ int main(int argc, char **argv) {
     if (http.joinable()) http.join(); // unblocks + waits for web clients
     if (sh.save_busy) std::printf("finishing save ...\n");
     sh.join_saver();
+    INSTRUMENTATION_ADD_NUM_CHANNELS(TR_CH_WEB0 + TR_WEB_LANES);
+    INSTRUMENTATION_END();
     for (const auto &m : sh.msgs.drain()) std::printf("  %s\n", m.c_str());
     return rc;
 }

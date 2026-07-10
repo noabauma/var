@@ -354,6 +354,7 @@ struct Shared {
     MessageQueue msgs;
     ScoreBoard *scores = nullptr; // web scoreboard (null = disabled)
     std::atomic<bool> alive{true};
+    std::atomic<bool> cam_ok{false}; // camera currently streaming
     std::atomic<bool> save_busy{false};
     std::atomic<bool> interactive{false};
     std::atomic<uint64_t> drops{0};
@@ -944,20 +945,22 @@ static std::shared_ptr<const Snapshot> save_now(const Cfg &cfg, Shared &sh,
 
 // ---------------------------------------------------------- V4L2 capture
 
-static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
-    TrThreadGuard tr_guard;
+// One full camera session: open, configure, stream until shutdown or failure.
+// Returns true on clean shutdown; false with `err` set when the camera is
+// missing or broke away mid-stream (the caller retries).
+static bool v4l2_capture_once(const Cfg &cfg, Shared *sh, std::string &err) {
     int fd = open(cfg.device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) { sh->set_error(errno_str("open " + cfg.device)); return; }
+    if (fd < 0) { err = errno_str("open " + cfg.device); return false; }
 
     v4l2_capability cap{};
     if (xioctl(fd, VIDIOC_QUERYCAP, &cap) != 0) {
-        sh->set_error(errno_str("VIDIOC_QUERYCAP")); close(fd); return;
+        err = errno_str("VIDIOC_QUERYCAP"); close(fd); return false;
     }
     uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps
                                                               : cap.capabilities;
     if (!(caps & V4L2_CAP_VIDEO_CAPTURE) || !(caps & V4L2_CAP_STREAMING)) {
-        sh->set_error(cfg.device + " does not support streaming video capture");
-        close(fd); return;
+        err = cfg.device + " does not support streaming video capture";
+        close(fd); return false;
     }
 
     v4l2_format fmt{};
@@ -967,12 +970,12 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     if (xioctl(fd, VIDIOC_S_FMT, &fmt) != 0) {
-        sh->set_error(errno_str("VIDIOC_S_FMT")); close(fd); return;
+        err = errno_str("VIDIOC_S_FMT"); close(fd); return false;
     }
     if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) {
-        sh->set_error(cfg.device + " does not offer MJPG — check "
-                      "`v4l2-ctl -d " + cfg.device + " --list-formats-ext`");
-        close(fd); return;
+        err = cfg.device + " does not offer MJPG — check "
+              "`v4l2-ctl -d " + cfg.device + " --list-formats-ext`";
+        close(fd); return false;
     }
     int aw = fmt.fmt.pix.width, ah = fmt.fmt.pix.height;
 
@@ -985,6 +988,45 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
         afps = (double)parm.parm.capture.timeperframe.denominator /
                parm.parm.capture.timeperframe.numerator;
     }
+
+    v4l2_requestbuffers req{};
+    req.count = 6;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) != 0 || req.count < 2) {
+        err = errno_str("VIDIOC_REQBUFS"); close(fd); return false;
+    }
+    struct Buf { void *ptr; size_t len; };
+    std::vector<Buf> bufs(req.count);
+    auto cleanup = [&]() {
+        for (auto &bf : bufs)
+            if (bf.ptr && bf.ptr != MAP_FAILED) munmap(bf.ptr, bf.len);
+        close(fd);
+    };
+    for (uint32_t i = 0; i < req.count; i++) {
+        v4l2_buffer b{};
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = i;
+        if (xioctl(fd, VIDIOC_QUERYBUF, &b) != 0) {
+            err = errno_str("VIDIOC_QUERYBUF"); cleanup(); return false;
+        }
+        bufs[i].len = b.length;
+        bufs[i].ptr = mmap(nullptr, b.length, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, b.m.offset);
+        if (bufs[i].ptr == MAP_FAILED) {
+            bufs[i].ptr = nullptr;
+            err = errno_str("mmap"); cleanup(); return false;
+        }
+        if (xioctl(fd, VIDIOC_QBUF, &b) != 0) {
+            err = errno_str("VIDIOC_QBUF"); cleanup(); return false;
+        }
+    }
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_STREAMON, &type) != 0) {
+        err = errno_str("VIDIOC_STREAMON"); cleanup(); return false;
+    }
+
     {
         char m[256];
         std::snprintf(m, sizeof m, "camera: %dx%d MJPG @ %.0f fps%s", aw, ah, afps,
@@ -993,38 +1035,7 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
                           ? "  (driver adjusted the requested mode!)" : "");
         sh->msgs.push(m);
     }
-
-    v4l2_requestbuffers req{};
-    req.count = 6;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-    if (xioctl(fd, VIDIOC_REQBUFS, &req) != 0 || req.count < 2) {
-        sh->set_error(errno_str("VIDIOC_REQBUFS")); close(fd); return;
-    }
-    struct Buf { void *ptr; size_t len; };
-    std::vector<Buf> bufs(req.count);
-    for (uint32_t i = 0; i < req.count; i++) {
-        v4l2_buffer b{};
-        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        b.memory = V4L2_MEMORY_MMAP;
-        b.index = i;
-        if (xioctl(fd, VIDIOC_QUERYBUF, &b) != 0) {
-            sh->set_error(errno_str("VIDIOC_QUERYBUF")); close(fd); return;
-        }
-        bufs[i].len = b.length;
-        bufs[i].ptr = mmap(nullptr, b.length, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, fd, b.m.offset);
-        if (bufs[i].ptr == MAP_FAILED) {
-            sh->set_error(errno_str("mmap")); close(fd); return;
-        }
-        if (xioctl(fd, VIDIOC_QBUF, &b) != 0) {
-            sh->set_error(errno_str("VIDIOC_QBUF")); close(fd); return;
-        }
-    }
-    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (xioctl(fd, VIDIOC_STREAMON, &type) != 0) {
-        sh->set_error(errno_str("VIDIOC_STREAMON")); close(fd); return;
-    }
+    sh->cam_ok = true;
 
     uint32_t expected_seq = 0;
     bool have_seq = false;
@@ -1033,7 +1044,7 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
         int r = poll(&p, 1, 200);
         if (r < 0) {
             if (errno == EINTR) continue;
-            sh->set_error(errno_str("poll(camera)"));
+            err = errno_str("poll(camera)");
             break;
         }
         if (r == 0) continue;
@@ -1043,7 +1054,7 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
         b.memory = V4L2_MEMORY_MMAP;
         if (xioctl(fd, VIDIOC_DQBUF, &b) != 0) {
             if (errno == EAGAIN) continue;
-            sh->set_error(errno_str("VIDIOC_DQBUF"));
+            err = errno_str("VIDIOC_DQBUF");
             break;
         }
         const uint8_t *d = (const uint8_t *)bufs[b.index].ptr;
@@ -1061,15 +1072,35 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
         bool qbuf_ok = xioctl(fd, VIDIOC_QBUF, &b) == 0;
         INSTRUMENTATION_MARK_RESET(TR_CH_CAPTURE);
         if (!qbuf_ok) {
-            sh->set_error(errno_str("VIDIOC_QBUF"));
+            err = errno_str("VIDIOC_QBUF");
             break;
         }
     }
 
     xioctl(fd, VIDIOC_STREAMOFF, &type);
-    for (auto &bf : bufs)
-        if (bf.ptr && bf.ptr != MAP_FAILED) munmap(bf.ptr, bf.len);
-    close(fd);
+    cleanup();
+    return err.empty(); // empty = left the loop because of shutdown
+}
+
+// Supervisor: keeps a session running and retries every 2 s while the camera
+// is unplugged/broken, so the web page (scoreboard, recordings, replays)
+// stays available camera-less and video resumes on hot-plug.
+static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
+    TrThreadGuard tr_guard;
+    bool announced = false;
+    while (sh->alive && !g_stop) {
+        std::string err;
+        bool clean = v4l2_capture_once(cfg, sh, err);
+        bool was_streaming = sh->cam_ok.exchange(false);
+        if (clean) break;
+        if (was_streaming || !announced) {
+            sh->msgs.push("camera unavailable (" + err +
+                          ") — retrying every 2 s; the web page stays up");
+            announced = true;
+        }
+        for (int i = 0; i < 20 && sh->alive && !g_stop; i++)
+            poll(nullptr, 0, 100);
+    }
 }
 
 // -------------------------------------------- test capture from .mjpeg file
@@ -1876,7 +1907,7 @@ cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
 (async function poll(){try{const s=await(await fetch('/status')).json();
   replayFrames=s.replay_frames;playFps=s.playback_fps;slow=Math.round(s.capture_fps/s.playback_fps);
   updAgain();
-  st.textContent=s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'% · drops '+s.drops+(s.save_busy?' · saving…':'');
+  st.textContent=(s.camera===false?'⚠ no camera — plug it in, video resumes automatically':s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'%')+' · drops '+s.drops+(s.save_busy?' · saving…':'');
 }catch(e){st.textContent='⚠ connection lost';}setTimeout(poll,1000);})();
 function fmtWhen(t){const d=new Date(t*1000),p=n=>String(n).padStart(2,'0');
  return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
@@ -2336,10 +2367,11 @@ static void handle_status(int fd, const Cfg &cfg, Shared *sh) {
     auto snap = sh->get_last_snap();
     char body[512];
     std::snprintf(body, sizeof body,
-                  "{\"fps\":%.1f,\"buffer_pct\":%zu,\"frames\":%zu,"
+                  "{\"camera\":%s,\"fps\":%.1f,\"buffer_pct\":%zu,\"frames\":%zu,"
                   "\"drops\":%llu,\"save_busy\":%s,\"last_clip\":\"%s\","
                   "\"replay_frames\":%zu,\"capture_fps\":%d,"
                   "\"playback_fps\":%d,\"buffer_seconds\":%.1f}",
+                  sh->cam_ok ? "true" : "false",
                   sh->ring.measured_fps(), fill, sh->ring.size(),
                   (unsigned long long)sh->drops.load(),
                   sh->save_busy ? "true" : "false",
@@ -2825,11 +2857,10 @@ int main(int argc, char **argv) {
     g_tr.scores_py = INSTRUMENTATION_MARK_ADD("scores_python");
     g_tr.clip_read = INSTRUMENTATION_MARK_ADD("clip_read_sd");
 
-    if (cfg.mjpeg_file.empty() && access(cfg.device.c_str(), F_OK) != 0) {
-        std::fprintf(stderr, "%s not found — is the camera plugged in?\n",
+    if (cfg.mjpeg_file.empty() && access(cfg.device.c_str(), F_OK) != 0)
+        std::fprintf(stderr, "warning: %s not found — starting without camera; "
+                             "capture begins automatically once it appears\n",
                      cfg.device.c_str());
-        return 1;
-    }
     if (!mkdirs(cfg.out_dir)) {
         std::fprintf(stderr, "%s\n", errno_str("cannot create " + cfg.out_dir).c_str());
         return 1;

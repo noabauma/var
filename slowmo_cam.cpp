@@ -1128,7 +1128,7 @@ static void file_capture_thread(Cfg cfg, Shared *sh) {
 // ------------------------------------------------------------- score board
 // Tournament rankings for the web page. Match results (who beat whom) are a
 // simple TSV file; the scores come from the *bias* PageRank in
-// score_function/page_rank_billiardino_algorithm_bias.py, called through
+// score_function/page_rank_biliardino_algorithm_bias.py, called through
 // score_function/compute_scores.py — the Python file stays the single
 // source of truth for the algorithm, so edits there flow to the live board.
 

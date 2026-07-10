@@ -6,8 +6,8 @@ Reads a win matrix on stdin, prints two lines of scores on stdout:
     usage:  compute_scores.py [d]   (PageRank damping factor, default 0.85)
     input:  N  followed by N*N matrix entries (whitespace-separated),
             where M[i][j] = 1 if team i won the (single) match vs team j
-    output: line 1 — bias PageRank  (page_rank_billiardino_algorithm_bias)
-            line 2 — classic PageRank (page_rank_billiardino_algorithm)
+    output: line 1 — bias PageRank  (page_rank_biliardino_algorithm_bias)
+            line 2 — classic PageRank (page_rank_biliardino_algorithm)
 
 Both algorithm files stay the single source of truth — edit them and the
 live scoreboard follows. recursive_deletion() is intentionally NOT applied:
@@ -22,8 +22,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
-from page_rank_billiardino_algorithm_bias import pagerank as pagerank_bias
-from page_rank_billiardino_algorithm import pagerank as pagerank_plain
+from page_rank_biliardino_algorithm_bias import pagerank as pagerank_bias
+from page_rank_biliardino_algorithm import pagerank as pagerank_plain
 
 
 def main():

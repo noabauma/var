@@ -47,7 +47,7 @@ localhost and open the https URL:
 https://<pi-ip>/             # any browser on the same network
 ```
 
-Log in as user **billiardino** (password: see `~/slowmo-cam-password.txt` on
+Log in as user **biliardino** (password: see `~/slowmo-cam-password.txt` on
 the Pi). The certificate is self-signed, so every device shows a warning
 *once* — "Advanced → proceed" accepts it; the connection is encrypted either
 way. Old `http://…:8080` bookmarks redirect to the https page.
@@ -109,9 +109,9 @@ The web page shows the **current tournament ranking**, switchable between
 the two score functions (both computed on every change, so the toggle is
 instant):
 
-- **Bias PageRank** — `page_rank_billiardino_algorithm_bias.py`
+- **Bias PageRank** — `page_rank_biliardino_algorithm_bias.py`
   (baseline ∝ games played, compensates uneven participation)
-- **Classic PageRank** — `page_rank_billiardino_algorithm.py`
+- **Classic PageRank** — `page_rank_biliardino_algorithm.py`
 
 Both Python files stay the single source of truth: the recorder calls them
 through `score_function/compute_scores.py`, so tweaking an algorithm

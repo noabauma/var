@@ -355,6 +355,7 @@ struct Shared {
     ScoreBoard *scores = nullptr; // web scoreboard (null = disabled)
     std::atomic<bool> alive{true};
     std::atomic<bool> cam_ok{false}; // camera currently streaming
+    std::atomic<int> viewers{0};     // browsers currently receiving video
     std::atomic<bool> save_busy{false};
     std::atomic<bool> interactive{false};
     std::atomic<uint64_t> drops{0};
@@ -1918,7 +1919,7 @@ cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
 (async function poll(){try{const s=await(await fetch('/status')).json();
   replayFrames=s.replay_frames;playFps=s.playback_fps;slow=Math.round(s.capture_fps/s.playback_fps);
   updAgain();
-  st.textContent=(s.camera===false?'⚠ no camera — plug it in, video resumes automatically':s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'%')+' · drops '+s.drops+(s.save_busy?' · saving…':'');
+  st.textContent=(s.camera===false?'⚠ no camera — plug it in, video resumes automatically':s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'%')+' · drops '+s.drops+' · 👁 '+s.viewers+(s.save_busy?' · saving…':'');
 }catch(e){st.textContent='⚠ connection lost';}setTimeout(poll,1000);})();
 function fmtWhen(t){const d=new Date(t*1000),p=n=>String(n).padStart(2,'0');
  return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
@@ -2261,9 +2262,17 @@ static void bound_stream_buffer(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
 }
 
+// counts a video connection (live or replay) for the page's viewer badge
+struct ViewerCount {
+    Shared *sh;
+    explicit ViewerCount(Shared *s) : sh(s) { sh->viewers++; }
+    ~ViewerCount() { sh->viewers--; }
+};
+
 static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
     if (fps > cfg.capture_fps) fps = cfg.capture_fps;
     bound_stream_buffer(fd);
+    ViewerCount vc(sh);
     if (!send_str(fd, kMjpegHeader, sh)) return;
     const double period = 1.0 / fps;
     double next = now_mono();
@@ -2293,6 +2302,7 @@ static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
 static void handle_replay(int fd, const Cfg &cfg, Shared *sh,
                           const std::string &path) {
     bound_stream_buffer(fd); // replays pace to the client, nothing skipped
+    ViewerCount vc(sh);
     std::string fname = query_str(path, "file");
     if (fname.empty()) {
         auto snap = sh->get_last_snap();
@@ -2389,11 +2399,12 @@ static void handle_status(int fd, const Cfg &cfg, Shared *sh) {
     auto snap = sh->get_last_snap();
     char body[512];
     std::snprintf(body, sizeof body,
-                  "{\"camera\":%s,\"fps\":%.1f,\"buffer_pct\":%zu,\"frames\":%zu,"
+                  "{\"camera\":%s,\"viewers\":%d,\"fps\":%.1f,"
+                  "\"buffer_pct\":%zu,\"frames\":%zu,"
                   "\"drops\":%llu,\"save_busy\":%s,\"last_clip\":\"%s\","
                   "\"replay_frames\":%zu,\"capture_fps\":%d,"
                   "\"playback_fps\":%d,\"buffer_seconds\":%.1f}",
-                  sh->cam_ok ? "true" : "false",
+                  sh->cam_ok ? "true" : "false", sh->viewers.load(),
                   sh->ring.measured_fps(), fill, sh->ring.size(),
                   (unsigned long long)sh->drops.load(),
                   sh->save_busy ? "true" : "false",

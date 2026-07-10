@@ -165,6 +165,9 @@ with nginx the whole stack survives a power cycle unattended.
 sudo systemctl status slowmo-cam     # is it running?
 sudo systemctl restart slowmo-cam    # e.g. after `make`
 journalctl -u slowmo-cam -f          # live logs
+# (re)install after editing the unit, whose source lives in this repo:
+sudo cp deploy/slowmo-cam.service /etc/systemd/system/ && \
+  sudo systemctl daemon-reload && sudo systemctl enable --now slowmo-cam
 ```
 
 ## Why this is much faster than the Python version

@@ -1,0 +1,19 @@
+[Unit]
+Description=slowmo-cam VAR recorder (live view + tournament scoreboard)
+Documentation=file:///home/noabauma/src/var/README.md
+After=network-online.target
+Wants=network-online.target
+# never stop retrying: the USB camera can enumerate late after boot,
+# and a power-brownout reboot must always come back on its own
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=noabauma
+WorkingDirectory=/home/noabauma/src/var
+ExecStart=/home/noabauma/src/var/slowmo_cam --bind 127.0.0.1 --port 8081
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

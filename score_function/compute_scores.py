@@ -3,6 +3,7 @@
 
 Reads a win matrix on stdin, prints two lines of scores on stdout:
 
+    usage:  compute_scores.py [d]   (PageRank damping factor, default 0.85)
     input:  N  followed by N*N matrix entries (whitespace-separated),
             where M[i][j] = 1 if team i won the (single) match vs team j
     output: line 1 — bias PageRank  (page_rank_billiardino_algorithm_bias)
@@ -26,6 +27,14 @@ from page_rank_billiardino_algorithm import pagerank as pagerank_plain
 
 
 def main():
+    d = 0.85
+    if len(sys.argv) > 1:
+        try:
+            d = float(sys.argv[1])
+        except ValueError:
+            sys.exit(f"bad damping factor {sys.argv[1]!r}")
+        if not 0.0 <= d <= 0.99:
+            sys.exit("damping factor must be in [0, 0.99]")
     data = sys.stdin.read().split()
     n = int(data[0])
     if n <= 0:
@@ -38,8 +47,8 @@ def main():
     M = np.array(vals, dtype=np.float64).reshape(n, n)
     # the classic pagerank() print()s its matrix — keep stdout clean
     with contextlib.redirect_stdout(io.StringIO()):
-        vb = pagerank_bias(M.copy(), 0.85, participation_bias=True)
-        vp = pagerank_plain(M.copy(), 0.85)
+        vb = pagerank_bias(M.copy(), d, participation_bias=True)
+        vp = pagerank_plain(M.copy(), d)
     print(" ".join(f"{x:.10f}" for x in vb))
     print(" ".join(f"{x:.10f}" for x in vp))
 

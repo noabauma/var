@@ -976,10 +976,11 @@ static void file_capture_thread(Cfg cfg, Shared *sh) {
 // score_function/compute_scores.py — the Python file stays the single
 // source of truth for the algorithm, so edits there flow to the live board.
 
-// Run `python3 script` with `input` on stdin, collect stdout. Bounded by
+// Run `python3 script arg` with `input` on stdin, collect stdout. Bounded by
 // timeout_ms (numpy's import on a Pi can take a couple of seconds cold).
-static bool run_script(const std::string &script, const std::string &input,
-                       std::string &output, std::string &err, int timeout_ms) {
+static bool run_script(const std::string &script, const std::string &arg,
+                       const std::string &input, std::string &output,
+                       std::string &err, int timeout_ms) {
     int in_p[2], out_p[2];
     if (pipe2(in_p, O_CLOEXEC) != 0) { err = errno_str("pipe"); return false; }
     if (pipe2(out_p, O_CLOEXEC) != 0) {
@@ -996,7 +997,7 @@ static bool run_script(const std::string &script, const std::string &input,
     if (pid == 0) {
         dup2(in_p[0], 0);
         dup2(out_p[1], 1); // stderr stays: script errors land in our log
-        execlp("python3", "python3", script.c_str(), (char *)nullptr);
+        execlp("python3", "python3", script.c_str(), arg.c_str(), (char *)nullptr);
         _exit(127);
     }
     close(in_p[0]);
@@ -1066,6 +1067,8 @@ struct ScoreBoard {
     std::vector<Match> matches;
     std::vector<double> cache_bias, cache_plain; // per-team; empty = stale
     std::string cache_err;
+    double damping = 0.85; // PageRank d, set from the web slider; not
+                           // persisted — a restart returns to the default
 
     static constexpr size_t kMaxTeams = 64;
     static constexpr size_t kMaxNameLen = 40;
@@ -1291,8 +1294,10 @@ struct ScoreBoard {
         }
         in += "\n";
         std::string out, err;
+        char darg[32];
+        std::snprintf(darg, sizeof darg, "%.4f", damping);
         INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.scores_py, (uint32_t)n);
-        bool script_ok = run_script(script, in, out, err, 30000);
+        bool script_ok = run_script(script, darg, in, out, err, 30000);
         INSTRUMENTATION_MARK_RESET(g_tr_ch);
         if (!script_ok) { cache_err = err; return; }
         const char *p = out.c_str();
@@ -1326,8 +1331,10 @@ struct ScoreBoard {
         }
         // teams in index order with both scores; the page sorts client-side,
         // so switching algorithms needs no server round-trip
-        std::string j = "{\"ok\":true,\"teams\":[";
         char buf[160];
+        std::snprintf(buf, sizeof buf, "{\"ok\":true,\"d\":%.4g,\"teams\":[",
+                      damping);
+        std::string j = buf;
         for (size_t i = 0; i < n; i++) {
             if (i) j += ',';
             j += "{\"name\":\"";
@@ -1425,6 +1432,23 @@ struct ScoreBoard {
         cache_bias.clear();
         cache_plain.clear();
         return save_locked(err);
+    }
+
+    // d < 1 keeps the power iteration convergent, hence the 0.99 cap
+    bool set_damping(const std::string &raw, std::string &err) {
+        char *end;
+        double v = strtod(raw.c_str(), &end);
+        if (end == raw.c_str() || *end != 0 || !(v >= 0.0 && v <= 0.99)) {
+            err = "d must be a number in [0, 0.99]";
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(m);
+        if (v != damping) {
+            damping = v;
+            cache_bias.clear();
+            cache_plain.clear();
+        }
+        return true;
     }
 
     bool add_team(const std::string &raw, std::string &err) {
@@ -1547,6 +1571,9 @@ button:disabled{opacity:.4;cursor:default}
 #algsw{display:flex;gap:8px;margin-bottom:10px}
 #algsw button{padding:7px 12px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
 #algsw button.on{background:#1c2530;border-color:#3b82f6;color:#fff}
+#dctl{display:flex;gap:10px;align-items:center;margin-bottom:10px;font-size:13px;color:#8b96a5}
+#dctl input{flex:1;max-width:240px;margin:0;accent-color:#3b82f6}
+#dctl b{color:#dfe6ee;font-variant-numeric:tabular-nums;min-width:2.6em}
 #board tbody tr{cursor:pointer}
 #board tbody tr:hover td,#board tr.sel td{background:#141a21}
 #detail{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:12px;margin-top:10px;font-size:14px}
@@ -1592,6 +1619,11 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <div id="algsw">
 <button id="algb" class="on">Bias PageRank</button>
 <button id="algp">Classic PageRank</button>
+</div>
+<div id="dctl" title="PageRank damping: how much of the score comes from match results (d) vs. the baseline (1−d)">
+<span>damping d</span>
+<input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">
+<b id="dval">0.85</b>
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 <div id="detail" hidden></div>
@@ -1718,9 +1750,14 @@ function renderTable(){if(!S)return;
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
+ if(typeof s.d==='number'&&document.activeElement!==dsl)
+  {dsl.value=s.d;dval.textContent=s.d.toFixed(2);}
  renderTable();renderDetail();}catch(e){}}
 $('algb').onclick=()=>{alg='bias';renderTable();};
 $('algp').onclick=()=>{alg='plain';renderTable();};
+const dsl=$('dsl'),dval=$('dval');
+dsl.oninput=()=>dval.textContent=(+dsl.value).toFixed(2);
+dsl.onchange=()=>post('/scores/d?value='+dsl.value);
 $('af').addEventListener('submit',async e=>{e.preventDefault();
  try{const r=await(await fetch('/scores/add?a='+encodeURIComponent($('ta').value)
   +'&b='+encodeURIComponent($('tb2').value)
@@ -2086,6 +2123,11 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             scores_mutation(fd, sh,
                             sh->scores->delete_match(query_str(path, "a"),
                                                      query_str(path, "b"), err),
+                            err);
+        } else if (method == "POST" && route == "/scores/d" && sh->scores) {
+            std::string err;
+            scores_mutation(fd, sh,
+                            sh->scores->set_damping(query_str(path, "value"), err),
                             err);
         }
         else if (method == "GET" && route == "/favicon.ico")

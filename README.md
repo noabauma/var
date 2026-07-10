@@ -110,7 +110,9 @@ Endpoints: `GET /scores` (both scores + all matches, JSON),
 `POST /scores/add?a=X&b=Y&games=10-9,10-4`,
 `POST /scores/rename?team=X&name=Y`, `POST /scores/undo`,
 `POST /scores/team/add?name=X`, `POST /scores/team/delete?name=X`,
-`POST /scores/match/edit?a=X&b=Y&games=…`, `POST /scores/match/delete?a=X&b=Y`.
+`POST /scores/match/edit?a=X&b=Y&games=…`, `POST /scores/match/delete?a=X&b=Y`,
+`POST /scores/d?value=0.85` (PageRank damping factor, 0–0.99; also a slider
+on the page; not persisted — a restart returns to 0.85).
 Options: `--scores-file PATH`, `--scores-script PATH`, `--no-scores`.
 Needs `python3` + `numpy` (already on the Pi).
 

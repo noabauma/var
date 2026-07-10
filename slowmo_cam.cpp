@@ -2241,8 +2241,18 @@ static bool send_part(int fd, const FrameData &f, Shared *sh) {
 }
 
 // Live camera -> browser, paced at `fps` (the ring keeps filling at 120).
+// Cap the kernel send buffer for live streams: a client slower than the
+// stream rate then back-pressures within ~2 frames instead of queueing
+// megabytes of stale video, and the pacing loop (which always sends the
+// newest frame) automatically degrades to fewer-but-fresh frames.
+static void bound_stream_buffer(int fd) {
+    int sb = 256 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
+}
+
 static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
     if (fps > cfg.capture_fps) fps = cfg.capture_fps;
+    bound_stream_buffer(fd);
     if (!send_str(fd, kMjpegHeader, sh)) return;
     const double period = 1.0 / fps;
     double next = now_mono();
@@ -2271,6 +2281,7 @@ static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
 // else the newest clip on disk — so replay also works right after a restart.
 static void handle_replay(int fd, const Cfg &cfg, Shared *sh,
                           const std::string &path) {
+    bound_stream_buffer(fd); // replays pace to the client, nothing skipped
     std::string fname = query_str(path, "file");
     if (fname.empty()) {
         auto snap = sh->get_last_snap();

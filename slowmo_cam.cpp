@@ -1757,6 +1757,7 @@ main::before{content:"";flex:none;width:250px} /* balances #recs so the cam stay
 @keyframes p{50%{opacity:.5}}
 footer{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;padding:14px}
 button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:12px 20px;cursor:pointer;background:#1c2530;color:#dfe6ee}
+footer select{font:inherit;font-weight:600;border:0;border-radius:10px;padding:12px 14px;background:#141a21;color:#8b96a5}
 button:disabled{opacity:.4;cursor:default}
 #save{background:#b3261e;color:#fff}
 #board{max-width:720px;margin:0 auto;padding:0 14px 8px;width:100%;box-sizing:border-box}
@@ -1836,6 +1837,12 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button id="save">&#128308; Save + replay</button>
 <button id="again" disabled>&#8635; Replay last</button>
 <button id="live">&#9679; Live</button>
+<select id="rate" title="live-stream rate — pick a lower one on slow connections (VPN, weak WiFi) for a smooth picture">
+<option value="">30 fps</option>
+<option value="15">15 fps</option>
+<option value="10">10 fps</option>
+<option value="5">5 fps</option>
+</select>
 </footer>
 <section id="board">
 <h2>Tournament</h2>
@@ -1880,7 +1887,8 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');
 let timer=0,replayFrames=0,playFps=30,slow=4,recs=[],playingRec=null;
 function live(){clearTimeout(timer);badge.hidden=true;playingRec=null;renderRecs();
-  cam.src='/stream?t='+Date.now();}
+  const r=localStorage.getItem('streamfps')||'';
+  cam.src='/stream?'+(r?'fps='+r+'&':'')+'t='+Date.now();}
 function replay(sec){clearTimeout(timer);badge.textContent='REPLAY '+slow+'× SLOW-MO';badge.hidden=false;
   cam.src='/replay?t='+Date.now();if(sec>0)timer=setTimeout(live,sec*1000+400);}
 function replayRec(name,sec){clearTimeout(timer);playingRec=name;renderRecs();
@@ -1895,6 +1903,9 @@ $('save').onclick=async()=>{$('save').disabled=true;
 $('again').onclick=()=>{if(replayFrames)replay(replayFrames/playFps);
   else if(recs.length)replayRec(recs[0].name,recs[0].fps>0?recs[0].frames/recs[0].fps:0);};
 $('live').onclick=live;cam.onclick=live;
+$('rate').value=localStorage.getItem('streamfps')||'';
+$('rate').onchange=e=>{localStorage.setItem('streamfps',e.target.value);
+  if(badge.hidden)live();};
 $('fs').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen();
   else $('wrap').requestFullscreen();};
 if(!document.documentElement.requestFullscreen)$('fs').hidden=true;

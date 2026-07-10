@@ -78,6 +78,21 @@ three buttons — **Save + replay** (same as pressing `s`), **Replay last**,
 the video (or `f`) toggles fullscreen. Keyboard works there too: `space`
 save, `r` replay, `f` fullscreen, `l`/`esc` back to live.
 
+**Watching over a slow link (VPN, weak WiFi):** the full stream is
+~24 Mbit/s; a slower connection gets automatically-degraded *fresh* frames,
+but for a really smooth picture pick a lower rate in the **fps selector**
+next to the Live button (15/10/5 fps — remembered per browser). Streams
+self-adapt server-side too: slow viewers never lag seconds behind.
+
+**Prefer it open like before (no password/TLS)?** Run the recorder with
+`--bind 0.0.0.0` (edit the `ExecStart` in `deploy/slowmo-cam.service`) and
+browse `http://<pi-ip>:8081` directly — sensible when everyone is on a
+trusted LAN or already inside a VPN/SSH tunnel that encrypts anyway.
+
+For the record: TLS is pinned to TLSv1.2 + ChaCha20-Poly1305 — the Pi 4's
+CPU has no AES hardware, and ChaCha20 encrypts ~11× faster there (nginx
+1.18 cannot steer TLSv1.3 cipher order, hence the pin).
+
 **Recordings panel:** to the right of the live view (the cam itself stays
 centered), every `*.avi` in the out-dir is listed newest-first (length,
 size, date). Click one to replay it in the browser; ✎ renames it — and

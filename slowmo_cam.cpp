@@ -509,6 +509,95 @@ static bool write_mjpg(const std::string &path, const Snapshot &frames,
     return true;
 }
 
+// Minimal reader for the files write_mjpg produces: finds the 'movi' list and
+// hands out its '00dc' chunks one frame at a time, so nothing but the headers
+// and the current frame is ever in RAM. Frame count and fps come from 'avih'.
+struct Reader {
+    FILE *fh = nullptr;
+    long movi_begin = 0, movi_end = 0; // chunk area inside the 'movi' list
+    long pos = 0;                      // next chunk to read
+    uint32_t frames = 0, fps = 0;
+
+    ~Reader() { if (fh) std::fclose(fh); }
+
+    static uint32_t u32(const uint8_t *p) {
+        return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+    }
+
+    bool open(const std::string &path, std::string &err) {
+        fh = std::fopen(path.c_str(), "rb");
+        if (!fh) { err = errno_str("open " + basename_of(path)); return false; }
+        uint8_t h[12];
+        if (std::fread(h, 1, 12, fh) != 12 || std::memcmp(h, "RIFF", 4) != 0 ||
+            std::memcmp(h + 8, "AVI ", 4) != 0) {
+            err = basename_of(path) + " is not an AVI file";
+            return false;
+        }
+        for (;;) { // walk the top-level chunks: parse 'hdrl', stop at 'movi'
+            uint8_t ch[8];
+            if (std::fread(ch, 1, 8, fh) != 8) { err = "no movi list"; return false; }
+            uint32_t sz = u32(ch + 4);
+            if (std::memcmp(ch, "LIST", 4) == 0 && sz >= 4) {
+                uint8_t lt[4];
+                if (std::fread(lt, 1, 4, fh) != 4) { err = "truncated AVI"; return false; }
+                if (std::memcmp(lt, "movi", 4) == 0) {
+                    movi_begin = pos = std::ftell(fh);
+                    movi_end = movi_begin + (long)sz - 4;
+                    return true;
+                }
+                if (std::memcmp(lt, "hdrl", 4) == 0) {
+                    // scan the header list (a few hundred bytes) for 'avih'
+                    std::vector<uint8_t> hd(std::min<uint32_t>(sz - 4, 4096));
+                    if (std::fread(hd.data(), 1, hd.size(), fh) != hd.size()) {
+                        err = "truncated AVI";
+                        return false;
+                    }
+                    for (size_t i = 0; i + 8 + 56 <= hd.size(); i++)
+                        if (std::memcmp(&hd[i], "avih", 4) == 0) {
+                            uint32_t us = u32(&hd[i + 8]); // dwMicroSecPerFrame
+                            frames = u32(&hd[i + 8 + 16]); // dwTotalFrames
+                            if (us) fps = (1000000u + us / 2) / us;
+                            break;
+                        }
+                    sz -= (uint32_t)hd.size(); // rest of the list still unread
+                }
+                sz -= 4; // the list type was consumed above
+            }
+            if (std::fseek(fh, (long)sz + (sz & 1), SEEK_CUR) != 0) {
+                err = "truncated AVI";
+                return false;
+            }
+        }
+    }
+
+    // next video frame; false at the end of the clip (err empty: rewind to loop)
+    bool next(FrameData &out, std::string &err) {
+        while (pos + 8 <= movi_end) {
+            uint8_t ch[8];
+            if (std::fseek(fh, pos, SEEK_SET) != 0 ||
+                std::fread(ch, 1, 8, fh) != 8) {
+                err = "read error";
+                return false;
+            }
+            uint32_t sz = u32(ch + 4);
+            pos += 8 + (long)sz + (sz & 1);
+            if (std::memcmp(ch, "00dc", 4) != 0 &&
+                std::memcmp(ch, "00db", 4) != 0)
+                continue; // not a video chunk ('rec ' lists etc.)
+            if (sz == 0 || sz > (64u << 20)) { err = "corrupt frame"; return false; }
+            out.resize(sz);
+            if (std::fread(out.data(), 1, sz, fh) != sz) {
+                err = "truncated frame";
+                return false;
+            }
+            return true;
+        }
+        return false; // clean end of movi
+    }
+
+    void rewind() { pos = movi_begin; }
+};
+
 } // namespace avi
 
 // ------------------------------------------------------------ child procs
@@ -700,6 +789,65 @@ static std::string clip_path(const Cfg &cfg) {
     return path;
 }
 
+// Auto-saved clips are the only prune candidates; a clip renamed away from
+// the slowmo_* pattern (web UI ✎) is kept forever.
+static bool is_autoclip(const std::string &n) {
+    return n.size() > 11 && n.compare(0, 7, "slowmo_") == 0 &&
+           n.compare(n.size() - 4, 4, ".avi") == 0;
+}
+
+// A clip name as it may appear in URLs and renames: a plain *.avi basename —
+// no path tricks, no hidden files, only tame characters.
+static bool safe_clip_name(const std::string &n) {
+    if (n.size() < 5 || n.size() > 96) return false;
+    if (n[0] == '.' || n.compare(n.size() - 4, 4, ".avi") != 0) return false;
+    for (char c : n)
+        if (!(isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-' ||
+              c == ' ' || c == '(' || c == ')'))
+            return false;
+    return n.find("..") == std::string::npos;
+}
+
+struct ClipInfo {
+    std::string name;
+    uint32_t frames = 0, fps = 0;
+    uint64_t bytes = 0;
+    time_t mtime = 0;
+    bool kept = false; // renamed -> out of prune_clips' reach
+};
+
+// Every *.avi in out_dir, newest first (for the web recordings panel).
+static std::vector<ClipInfo> list_clips(const Cfg &cfg) {
+    std::vector<ClipInfo> out;
+    DIR *d = opendir(cfg.out_dir.c_str());
+    if (!d) return out;
+    dirent *e;
+    while ((e = readdir(d)) != nullptr) {
+        std::string n = e->d_name;
+        if (n.size() < 5 || n[0] == '.' ||
+            n.compare(n.size() - 4, 4, ".avi") != 0)
+            continue;
+        ClipInfo ci;
+        ci.name = n;
+        ci.kept = !is_autoclip(n);
+        const std::string full = cfg.out_dir + "/" + n;
+        struct stat st{};
+        if (stat(full.c_str(), &st) == 0) {
+            ci.bytes = (uint64_t)st.st_size;
+            ci.mtime = st.st_mtime;
+        }
+        avi::Reader r;
+        std::string err;
+        if (r.open(full, err)) { ci.frames = r.frames; ci.fps = r.fps; }
+        out.push_back(std::move(ci));
+    }
+    closedir(d);
+    std::sort(out.begin(), out.end(), [](const ClipInfo &a, const ClipInfo &b) {
+        return a.mtime != b.mtime ? a.mtime > b.mtime : a.name > b.name;
+    });
+    return out;
+}
+
 // Delete the oldest slowmo_*.avi in out_dir beyond cfg.max_clips. Clip names
 // start with a timestamp, so lexicographic order == chronological order.
 static void prune_clips(const Cfg &cfg, Shared *sh) {
@@ -710,9 +858,7 @@ static void prune_clips(const Cfg &cfg, Shared *sh) {
     dirent *e;
     while ((e = readdir(d)) != nullptr) {
         std::string n = e->d_name;
-        if (n.size() > 11 && n.compare(0, 7, "slowmo_") == 0 &&
-            n.compare(n.size() - 4, 4, ".avi") == 0)
-            clips.push_back(n);
+        if (is_autoclip(n)) clips.push_back(n);
     }
     closedir(d);
     if ((int)clips.size() <= cfg.max_clips) return;
@@ -1548,10 +1694,25 @@ body{margin:0;background:#0b0e12;color:#dfe6ee;font:15px/1.45 system-ui,sans-ser
 header{display:flex;align-items:baseline;gap:12px;padding:10px 16px}
 h1{font-size:16px;margin:0;font-weight:600}
 #st{margin-left:auto;font-variant-numeric:tabular-nums;color:#8b96a5;font-size:13px}
-main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10px}
+main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10px;gap:14px}
+main::before{content:"";flex:none;width:250px} /* balances #recs so the cam stays centered */
 #wrap{position:relative;width:100%;max-width:1280px}
+#recs{flex:none;width:250px;max-height:min(72vh,720px);overflow-y:auto;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
+#recs h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:2px 0 8px}
+.rit{padding:6px;border-radius:8px;cursor:pointer}
+.rit:hover,.rit.on{background:#141a21}
+.rit .nm{font-size:13px;color:#dfe6ee;word-break:break-all;display:flex;align-items:center;gap:4px}
+.rit .nm span{flex:1}
+.rit .keep{color:#e5c07b}
+.rit .meta{font-size:11px;color:#5c6672;margin-top:2px}
+#rnone{color:#5c6672;font-size:12px}
+@media(max-width:1000px){main{flex-direction:column}main::before{display:none}#recs{width:100%;max-width:1280px;max-height:38vh}}
 #cam{width:100%;display:block;border-radius:10px;background:#000;aspect-ratio:16/9;object-fit:contain}
 #badge{position:absolute;top:12px;left:12px;background:#c0231d;color:#fff;font-weight:700;padding:4px 12px;border-radius:6px;letter-spacing:1px;font-size:13px;animation:p 1s infinite}
+#fs{position:absolute;top:12px;right:12px;display:flex;align-items:center;background:rgba(11,14,18,.55);border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:8px;line-height:0;opacity:.65}
+#fs:hover{opacity:1}
+#wrap:fullscreen{max-width:none;background:#000}
+#wrap:fullscreen #cam{width:100%;height:100%;aspect-ratio:auto;border-radius:0}
 @keyframes p{50%{opacity:.5}}
 footer{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;padding:14px}
 button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:12px 20px;cursor:pointer;background:#1c2530;color:#dfe6ee}
@@ -1592,7 +1753,25 @@ button:disabled{opacity:.4;cursor:default}
 #tf input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;flex:1;min-width:8em}
 #tf button{padding:9px 14px}
 #board h3{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:20px 0 6px}
-#vswrap{overflow-x:auto}
+#h2hwide{width:calc(100vw - 28px);max-width:1280px;position:relative;left:50%;transform:translateX(-50%)}
+#h2h{display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap}
+#vswrap{overflow-x:auto;flex:1 1 auto;min-width:0}
+#gwrap{flex:0 1 400px;min-width:280px;max-width:430px}
+#gwrap svg{width:100%;height:auto;display:block}
+#gcap{color:#5c6672;font-size:12px;margin-top:4px}
+#gcap .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 4px 0 10px}
+#gcap .sw:first-child{margin-left:0}
+.ge line{stroke:#5c6672;stroke-width:2}
+.ge polygon{fill:#5c6672}
+.ge.w line{stroke:#81c784}.ge.w polygon{fill:#81c784}
+.ge.l line{stroke:#e57373}.ge.l polygon{fill:#e57373}
+.ge.dim{opacity:.12}
+.gn{cursor:pointer}
+.gn .dot{fill:#8b96a5}
+.gn.sel .dot{fill:#3b82f6}
+.gn .hit{fill:transparent}
+.gn text{fill:#aeb9c7;font:11px system-ui,sans-serif}
+.gn:hover .dot,.gn:hover text{fill:#fff}
 #board table.vs{width:auto;font-size:13px}
 #board table.vs th,#board table.vs td{text-align:center;padding:4px 8px;border:1px solid #1c2530;min-width:26px;width:auto;color:#dfe6ee}
 #board table.vs thead th{color:#8b96a5;font-size:12px}
@@ -1608,7 +1787,10 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 #help{text-align:center;color:#5c6672;font-size:12px;padding-bottom:12px}
 </style>
 <header><h1>slowmo-cam</h1><span id="st">connecting&hellip;</span></header>
-<main><div id="wrap"><img id="cam" src="/stream" alt="live"><div id="badge" hidden>REPLAY</div></div></main>
+<main>
+<div id="wrap"><img id="cam" src="/stream" alt="live"><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
+<aside id="recs"><h2>Recordings</h2><div id="rlist"></div></aside>
+</main>
 <footer>
 <button id="save">&#128308; Save + replay</button>
 <button id="again" disabled>&#8635; Replay last</button>
@@ -1641,30 +1823,90 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button type="submit">Add team</button>
 </form>
 <div id="serr"></div>
+<div id="h2hwide">
 <h3>Head-to-head</h3>
+<div id="h2h">
 <div id="vswrap"></div>
+<div id="gwrap">
+<svg id="gsvg" viewBox="0 0 360 360" role="img" aria-label="who beat whom, as a graph"></svg>
+<div id="gcap"><span class="sw" style="background:#81c784"></span>wins <span class="sw" style="background:#e57373"></span>losses of the hovered team · arrow points at the loser · click selects</div>
+</div>
+</div>
+</div>
 </section>
-<div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
+<div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>f</kbd> fullscreen&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
 <script>
 const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');
-let timer=0,replayFrames=0,playFps=30,slow=4;
-function live(){clearTimeout(timer);badge.hidden=true;cam.src='/stream?t='+Date.now();}
+let timer=0,replayFrames=0,playFps=30,slow=4,recs=[],playingRec=null;
+function live(){clearTimeout(timer);badge.hidden=true;playingRec=null;renderRecs();
+  cam.src='/stream?t='+Date.now();}
 function replay(sec){clearTimeout(timer);badge.textContent='REPLAY '+slow+'× SLOW-MO';badge.hidden=false;
   cam.src='/replay?t='+Date.now();if(sec>0)timer=setTimeout(live,sec*1000+400);}
+function replayRec(name,sec){clearTimeout(timer);playingRec=name;renderRecs();
+  badge.textContent='REPLAY '+name.replace(/\.avi$/,'');badge.hidden=false;
+  cam.src='/replay?file='+encodeURIComponent(name)+'&t='+Date.now();
+  if(sec>0)timer=setTimeout(live,sec*1000+400);}
+function updAgain(){$('again').disabled=!replayFrames&&!recs.length;}
 $('save').onclick=async()=>{$('save').disabled=true;
-  try{const j=await(await fetch('/save',{method:'POST'})).json();if(j.ok)replay(j.playback_seconds);}
+  try{const j=await(await fetch('/save',{method:'POST'})).json();
+   if(j.ok){replay(j.playback_seconds);setTimeout(recsPoll,3000);}}
   catch(e){}finally{$('save').disabled=false;}};
-$('again').onclick=()=>{if(replayFrames)replay(replayFrames/playFps);};
+$('again').onclick=()=>{if(replayFrames)replay(replayFrames/playFps);
+  else if(recs.length)replayRec(recs[0].name,recs[0].fps>0?recs[0].frames/recs[0].fps:0);};
 $('live').onclick=live;cam.onclick=live;
+$('fs').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen();
+  else $('wrap').requestFullscreen();};
+if(!document.documentElement.requestFullscreen)$('fs').hidden=true;
 addEventListener('keydown',e=>{if(e.target&&e.target.tagName==='INPUT')return;
   if(e.code==='Space'){e.preventDefault();$('save').click();}
-  else if(e.key==='r')$('again').click();else if(e.key==='l'||e.key==='Escape')live();});
+  else if(e.key==='r')$('again').click();else if(e.key==='f')$('fs').click();
+  else if(e.key==='l')live();
+  else if(e.key==='Escape'&&!document.fullscreenElement)live();});
 cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
 (async function poll(){try{const s=await(await fetch('/status')).json();
   replayFrames=s.replay_frames;playFps=s.playback_fps;slow=Math.round(s.capture_fps/s.playback_fps);
-  $('again').disabled=!replayFrames;
+  updAgain();
   st.textContent=s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'% · drops '+s.drops+(s.save_busy?' · saving…':'');
 }catch(e){st.textContent='⚠ connection lost';}setTimeout(poll,1000);})();
+function fmtWhen(t){const d=new Date(t*1000),p=n=>String(n).padStart(2,'0');
+ return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
+function renderRecs(){const rl=$('rlist');rl.innerHTML='';
+ if(!recs.length){const p=document.createElement('div');p.id='rnone';
+  p.textContent='no recordings yet';rl.appendChild(p);return;}
+ recs.forEach(f=>{const it=document.createElement('div');
+  it.className='rit'+(f.name===playingRec?' on':'');it.title='click to replay '+f.name;
+  const nm=document.createElement('div');nm.className='nm';
+  if(f.kept){const k=document.createElement('b');k.className='keep';k.textContent='★';
+   k.title='renamed — never auto-pruned';nm.appendChild(k);}
+  const s=document.createElement('span');s.textContent=f.name.replace(/\.avi$/,'');
+  nm.appendChild(s);
+  const rb=document.createElement('button');rb.textContent='✎';rb.className='mbtn';
+  rb.title='rename (renamed clips are kept forever)';
+  rb.onclick=async ev=>{ev.stopPropagation();
+   const nv=prompt('New name for '+f.name+' (renamed clips are never auto-pruned):',
+    f.name.replace(/\.avi$/,''));
+   if(nv==null||!nv.trim())return;
+   try{const r=await(await fetch('/recordings/rename?file='+encodeURIComponent(f.name)
+    +'&name='+encodeURIComponent(nv.trim()),{method:'POST'})).json();
+    if(!r.ok)alert(r.error);else{if(playingRec===f.name)playingRec=null;recsPoll();}}catch(e){}};
+  nm.appendChild(rb);
+  const db=document.createElement('button');db.textContent='🗑';db.className='mbtn';
+  db.title='delete this clip (permanent)';
+  db.onclick=async ev=>{ev.stopPropagation();
+   if(!confirm('Delete '+f.name+' forever?'))return;
+   try{const r=await(await fetch('/recordings/delete?file='+encodeURIComponent(f.name),
+    {method:'POST'})).json();
+    if(!r.ok)alert(r.error);else{if(playingRec===f.name)live();recsPoll();}}catch(e){}};
+  nm.appendChild(db);
+  const meta=document.createElement('div');meta.className='meta';
+  meta.textContent=(f.fps>0?(f.frames/f.fps).toFixed(1)+' s · ':'')
+   +(f.bytes/1e6).toFixed(1)+' MB · '+fmtWhen(f.mtime);
+  it.appendChild(nm);it.appendChild(meta);
+  it.onclick=()=>replayRec(f.name,f.fps>0?f.frames/f.fps:0);
+  rl.appendChild(it);});}
+async function recsPoll(){try{const r=await(await fetch('/recordings')).json();
+ if(r.ok){recs=r.files;renderRecs();updAgain();}}catch(e){}}
+recsPoll();setInterval(recsPoll,15000);
 let S=null,alg='bias',selTeam=-1;
 const enc=encodeURIComponent;
 async function post(u){try{const r=await(await fetch(u,{method:'POST'})).json();
@@ -1735,6 +1977,46 @@ function renderVs(idx){const wrap=$('vswrap');wrap.innerHTML='';
    else{tr.appendChild(vcell('np','–'));}});
   tr.appendChild(vcell('tot',w));tbody.appendChild(tr);});
  tbl.appendChild(tbody);wrap.appendChild(tbl);}
+function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
+ svg.textContent='';
+ if(!S||!idx.length)return;
+ const n=idx.length,W=360,cx=W/2,cy=W/2,R=n>1?128:0,NR=5;
+ const pos={};
+ idx.forEach((ti,k)=>{const a=-Math.PI/2+2*Math.PI*k/n;
+  pos[ti]=[cx+R*Math.cos(a),cy+R*Math.sin(a),a];});
+ const el=(t,at)=>{const e=document.createElementNS(NS,t);
+  for(const k in at)e.setAttribute(k,at[k]);return e;};
+ const edges=[];
+ S.matches.forEach(m=>{const w=m.winner,l=w===m.a?m.b:m.a;
+  const p=pos[w],q=pos[l];if(!p||!q)return;
+  const dx=q[0]-p[0],dy=q[1]-p[1],d=Math.hypot(dx,dy)||1,ux=dx/d,uy=dy/d;
+  const x1=p[0]+ux*(NR+2),y1=p[1]+uy*(NR+2),
+        tx=q[0]-ux*(NR+3),ty=q[1]-uy*(NR+3),   // arrowhead tip at the loser
+        bx=tx-ux*7,by=ty-uy*7;                 // arrowhead base
+  const g=el('g',{'class':'ge'});g.dataset.w=w;g.dataset.l=l;
+  g.appendChild(el('line',{x1:x1,y1:y1,x2:bx+ux,y2:by+uy}));
+  g.appendChild(el('polygon',{points:tx+','+ty+' '+(bx-uy*3.5)+','+(by+ux*3.5)
+   +' '+(bx+uy*3.5)+','+(by-ux*3.5)}));
+  const t=document.createElementNS(NS,'title');
+  t.textContent=S.teams[w].name+' beat '+S.teams[l].name
+   +(m.games.length?' ('+fmtGames(m,w===m.a)+')':'');
+  g.appendChild(t);svg.appendChild(g);edges.push(g);});
+ idx.forEach(ti=>{const p=pos[ti],full=S.teams[ti].name;
+  const g=el('g',{'class':'gn'+(ti===selTeam?' sel':'')});
+  g.appendChild(el('circle',{'class':'hit',cx:p[0],cy:p[1],r:14}));
+  g.appendChild(el('circle',{'class':'dot',cx:p[0],cy:p[1],r:NR}));
+  const c=Math.cos(p[2]),s=Math.sin(p[2]),
+        lx=cx+(R+13)*c,ly=cy+(R+13)*s;
+  const txt=el('text',{x:lx,y:ly+(s>.5?9:s<-.5?-4:3),
+   'text-anchor':c>.25?'start':c<-.25?'end':'middle'});
+  txt.textContent=full.length>12?full.slice(0,11)+'…':full;
+  const t=document.createElementNS(NS,'title');t.textContent=full;
+  g.appendChild(t);g.appendChild(txt);
+  g.onmouseenter=()=>edges.forEach(e=>{e.setAttribute('class',
+   +e.dataset.w===ti?'ge w':+e.dataset.l===ti?'ge l':'ge dim');});
+  g.onmouseleave=()=>edges.forEach(e=>e.setAttribute('class','ge'));
+  g.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
+  svg.appendChild(g);});}
 function renderTable(){if(!S)return;
  const tb=$('tb'),dl=$('tlist');tb.innerHTML='';dl.innerHTML='';
  const idx=S.teams.map((t,i)=>i).sort((x,y)=>S.teams[y][alg]-S.teams[x][alg]
@@ -1746,7 +2028,8 @@ function renderTable(){if(!S)return;
   if(ti===selTeam)tr.className='sel';
   tb.appendChild(tr);
   const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
- $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';renderVs(idx);}
+ $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';
+ renderVs(idx);renderGraph(idx);}
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
@@ -1941,19 +2224,60 @@ static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
     }
 }
 
-// Last saved clip from RAM at playback fps, looping until the client leaves
-// (the control page switches itself back to /stream after one pass).
-static void handle_replay(int fd, const Cfg &cfg, Shared *sh) {
-    auto snap = sh->get_last_snap();
-    if (!snap || snap->empty()) {
+// Replay a clip as MJPEG, looping until the client leaves (the control page
+// switches itself back to /stream after one pass). Sources, in order:
+// ?file=name.avi from out_dir; this session's last save (straight from RAM);
+// else the newest clip on disk — so replay also works right after a restart.
+static void handle_replay(int fd, const Cfg &cfg, Shared *sh,
+                          const std::string &path) {
+    std::string fname = query_str(path, "file");
+    if (fname.empty()) {
+        auto snap = sh->get_last_snap();
+        if (snap && !snap->empty()) {
+            if (!send_str(fd, kMjpegHeader, sh)) return;
+            const double period = 1.0 / cfg.playback_fps;
+            double next = now_mono();
+            size_t i = 0;
+            while (sh->alive && !g_stop) {
+                double t = now_mono();
+                if (t < next) {
+                    int ms = (int)((next - t) * 1000.0);
+                    poll(nullptr, 0, ms > 100 ? 100 : (ms < 1 ? 1 : ms));
+                    continue;
+                }
+                INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.stream_send,
+                                         (uint32_t)((*snap)[i]->size() >> 10));
+                bool sent = send_part(fd, *(*snap)[i], sh);
+                INSTRUMENTATION_MARK_RESET(g_tr_ch);
+                if (!sent) return;
+                i = (i + 1) % snap->size();
+                next += period;
+                if (next < t - 1.0) next = t;
+            }
+            return;
+        }
+        auto clips = list_clips(cfg); // fresh session: newest clip on disk
+        if (!clips.empty()) fname = clips[0].name;
+    }
+    if (fname.empty() || !safe_clip_name(fname)) {
         send_simple(fd, sh, "404 Not Found", "application/json",
                     "{\"ok\":false,\"error\":\"nothing saved yet\"}");
         return;
     }
+    avi::Reader r;
+    std::string err;
+    if (!r.open(cfg.out_dir + "/" + fname, err)) {
+        std::string body = "{\"ok\":false,\"error\":\"";
+        json_escape(body, err);
+        send_simple(fd, sh, "404 Not Found", "application/json", body + "\"}");
+        return;
+    }
     if (!send_str(fd, kMjpegHeader, sh)) return;
-    const double period = 1.0 / cfg.playback_fps;
+    const int fps =
+        r.fps > 0 && r.fps <= 240 ? (int)r.fps : cfg.playback_fps;
+    const double period = 1.0 / fps;
     double next = now_mono();
-    size_t i = 0;
+    FrameData frame;
     while (sh->alive && !g_stop) {
         double t = now_mono();
         if (t < next) {
@@ -1961,12 +2285,16 @@ static void handle_replay(int fd, const Cfg &cfg, Shared *sh) {
             poll(nullptr, 0, ms > 100 ? 100 : (ms < 1 ? 1 : ms));
             continue;
         }
+        if (!r.next(frame, err)) {
+            if (!err.empty()) return;        // damaged file: end the stream
+            r.rewind();                      // clean end of clip: loop
+            if (!r.next(frame, err)) return; // no video chunks at all
+        }
         INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.stream_send,
-                                 (uint32_t)((*snap)[i]->size() >> 10));
-        bool sent = send_part(fd, *(*snap)[i], sh);
+                                 (uint32_t)(frame.size() >> 10));
+        bool sent = send_part(fd, frame, sh);
         INSTRUMENTATION_MARK_RESET(g_tr_ch);
         if (!sent) return;
-        i = (i + 1) % snap->size();
         next += period;
         if (next < t - 1.0) next = t;
     }
@@ -2072,6 +2400,81 @@ static void scores_mutation(int fd, Shared *sh, bool ok, const std::string &err)
     send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
 }
 
+// GET /recordings — every *.avi in out_dir, newest first, for the side panel
+static void handle_recordings(int fd, const Cfg &cfg, Shared *sh) {
+    auto clips = list_clips(cfg);
+    std::string j = "{\"ok\":true,\"files\":[";
+    char buf[160];
+    for (size_t i = 0; i < clips.size(); i++) {
+        const ClipInfo &c = clips[i];
+        if (i) j += ',';
+        j += "{\"name\":\"";
+        json_escape(j, c.name);
+        std::snprintf(buf, sizeof buf,
+                      "\",\"frames\":%u,\"fps\":%u,\"bytes\":%llu,"
+                      "\"mtime\":%lld,\"kept\":%s}",
+                      c.frames, c.fps, (unsigned long long)c.bytes,
+                      (long long)c.mtime, c.kept ? "true" : "false");
+        j += buf;
+    }
+    send_simple(fd, sh, "200 OK", "application/json", j + "]}");
+}
+
+// POST /recordings/rename?file=old.avi&name=new — renamed clips no longer
+// match the slowmo_* pattern, so prune_clips leaves them alone forever.
+static void handle_recording_rename(int fd, const Cfg &cfg, Shared *sh,
+                                    const std::string &path) {
+    std::string oldn = query_str(path, "file");
+    std::string newn = query_str(path, "name");
+    size_t a = newn.find_first_not_of(' ');
+    newn = a == std::string::npos
+               ? ""
+               : newn.substr(a, newn.find_last_not_of(' ') - a + 1);
+    if (newn.size() < 4 || newn.compare(newn.size() - 4, 4, ".avi") != 0)
+        newn += ".avi";
+    std::string err;
+    if (!safe_clip_name(oldn))
+        err = "bad file name";
+    else if (!safe_clip_name(newn))
+        err = "names may use letters, digits, space and . _ - ( )";
+    else if (is_autoclip(newn))
+        err = "slowmo_* names are reserved for auto-saved clips (they get "
+              "pruned) — pick another name to keep it";
+    else if (access((cfg.out_dir + "/" + oldn).c_str(), F_OK) != 0)
+        err = "no clip named \"" + oldn + "\"";
+    else if (newn != oldn &&
+             access((cfg.out_dir + "/" + newn).c_str(), F_OK) == 0)
+        err = "\"" + newn + "\" already exists";
+    else if (rename((cfg.out_dir + "/" + oldn).c_str(),
+                    (cfg.out_dir + "/" + newn).c_str()) != 0)
+        err = errno_str("rename");
+    if (!err.empty()) {
+        scores_error(fd, sh, "400 Bad Request", err);
+        return;
+    }
+    if (basename_of(sh->get_last_path()) == oldn)
+        sh->set_last_path(cfg.out_dir + "/" + newn);
+    sh->msgs.push("renamed " + oldn + " -> " + newn + " (kept forever)");
+    send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
+}
+
+// POST /recordings/delete?file=X — permanent; the web page confirms first
+static void handle_recording_delete(int fd, const Cfg &cfg, Shared *sh,
+                                    const std::string &path) {
+    std::string fname = query_str(path, "file");
+    std::string err;
+    if (!safe_clip_name(fname))
+        err = "bad file name";
+    else if (unlink((cfg.out_dir + "/" + fname).c_str()) != 0)
+        err = errno_str("delete " + fname);
+    if (!err.empty()) {
+        scores_error(fd, sh, "400 Bad Request", err);
+        return;
+    }
+    sh->msgs.push("deleted " + fname);
+    send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
+}
+
 static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     TrThreadGuard tr_guard;
     g_tr_ch = TR_CH_WEB0 + (g_tr_web_seq++ % TR_WEB_LANES);
@@ -2093,9 +2496,15 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
         else if (method == "GET" && route == "/stream")
             handle_stream(fd, cfg, sh, query_int(path, "fps", cfg.http_fps));
         else if (method == "GET" && route == "/replay")
-            handle_replay(fd, cfg, sh);
+            handle_replay(fd, cfg, sh, path);
         else if (method == "POST" && route == "/save")
             handle_save(fd, cfg, sh);
+        else if (method == "GET" && route == "/recordings")
+            handle_recordings(fd, cfg, sh);
+        else if (method == "POST" && route == "/recordings/rename")
+            handle_recording_rename(fd, cfg, sh, path);
+        else if (method == "POST" && route == "/recordings/delete")
+            handle_recording_delete(fd, cfg, sh, path);
         else if (method == "GET" && route == "/status")
             handle_status(fd, cfg, sh);
         else if (method == "GET" && route == "/scores")

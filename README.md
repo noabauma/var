@@ -51,8 +51,17 @@ ssh -L 8080:localhost:8080 noabauma@<pi-ip>   # then open http://localhost:8080
 
 The page shows the **live camera**, a status bar (fps / buffer / drops), and
 three buttons — **Save + replay** (same as pressing `s`), **Replay last**,
-**Live** — so any phone on the WiFi can be the VAR trigger. Keyboard works
-there too: `space` save, `r` replay, `l`/`esc` back to live.
+**Live** — so any phone on the WiFi can be the VAR trigger. The ⛶ button on
+the video (or `f`) toggles fullscreen. Keyboard works there too: `space`
+save, `r` replay, `f` fullscreen, `l`/`esc` back to live.
+
+**Recordings panel:** to the right of the live view (the cam itself stays
+centered), every `*.avi` in the out-dir is listed newest-first (length,
+size, date). Click one to replay it in the browser; ✎ renames it — and
+since the auto-pruner only ever deletes `slowmo_*.avi`, a renamed clip is
+**kept forever** (★); 🗑 deletes it (with confirmation). **Replay last**
+works across restarts: with nothing saved this session it falls back to the
+newest clip on disk.
 
 **Why live view + VAR work simultaneously:** a UVC camera can only be opened
 by *one* process — two programs would conflict (`Device or resource busy`).
@@ -64,9 +73,12 @@ once, and streaming costs near-zero CPU. Recording never pauses — saves and
 terminal replays keep working while any number of browsers watch.
 
 Endpoints (for scripting): `GET /stream` (live MJPEG, `?fps=N` to lower the
-rate), `GET /replay` (last clip from RAM, loops), `POST /save` (trigger a
-save, returns JSON), `GET /status` (JSON). No authentication — trusted
-LAN/tunnel only.
+rate), `GET /replay` (last clip from RAM, loops; `?file=name.avi` replays a
+clip from disk; with nothing in RAM the newest clip on disk plays),
+`POST /save` (trigger a save, returns JSON), `GET /status` (JSON),
+`GET /recordings` (JSON list of clips), `POST /recordings/rename?file=X&name=Y`
+(renamed clips escape auto-pruning), `POST /recordings/delete?file=X`.
+No authentication — trusted LAN/tunnel only.
 
 ## Tournament scoreboard
 
@@ -86,6 +98,11 @@ mid-tournament.)
 
 **Entering matches** — one big group, every match is a **best of three**
 to 10, and **each pair of teams plays at most once**:
+
+Below the ranking, the **head-to-head** section shows who played whom as a
+matrix *and* as a directed graph next to it (teams on a circle in ranking
+order, arrows point from winner to loser; hovering a team colours its wins
+green and losses red, clicking selects the team).
 
 - Fill in *team A*, *team B* and the game scores **from A's perspective**,
   e.g. `10-9, 10-4` (2-0) or `10-1, 5-10, 10-9` (2-1). The winner is

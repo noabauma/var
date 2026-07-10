@@ -85,14 +85,19 @@
 #define INSTRUMENTATION_TRACE_PATH(p) (void)0
 #endif
 
-// visualization lanes: 0 = camera capture, 1 = clip saver, 2.. = web clients
-// (client threads round-robin over TR_WEB_LANES lanes)
-enum { TR_CH_CAPTURE = 0, TR_CH_SAVER = 1, TR_CH_WEB0 = 2, TR_WEB_LANES = 4 };
+// Visualization lanes. One lane must never carry two concurrent activities,
+// or the SET/RESET pairs interleave and the reconstructed durations are
+// garbage: capture/saver/scores are single-threaded by construction and get
+// fixed lanes; short HTTP requests share one lane (they are ms-scale and
+// effectively serial); each long-lived stream picks its own lane.
+enum { TR_CH_CAPTURE = 0, TR_CH_SAVER = 1, TR_CH_SCORES = 2, TR_CH_HTTP = 3,
+       TR_CH_STREAM0 = 4, TR_STREAM_LANES = 4 };
 static struct {
-    uint16_t frame_ingest, avi_write, prune, http_req, stream_send, scores_py;
+    uint16_t frame_ingest, avi_write, prune, http_req, stream_send, scores_py,
+             clip_read;
 } g_tr;
 static std::atomic<int> g_tr_web_seq{0};
-static thread_local int g_tr_ch = TR_CH_WEB0;
+static thread_local int g_tr_ch = TR_CH_HTTP;
 
 // registers/deregisters the calling thread with TraCR on every exit path
 struct TrThreadGuard {
@@ -1447,9 +1452,9 @@ struct ScoreBoard {
         std::string out, err;
         char darg[32];
         std::snprintf(darg, sizeof darg, "%.4f", damping);
-        INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.scores_py, (uint32_t)n);
+        INSTRUMENTATION_MARK_SET(TR_CH_SCORES, g_tr.scores_py, (uint32_t)n);
         bool script_ok = run_script(script, darg, in, out, err, 30000);
-        INSTRUMENTATION_MARK_RESET(g_tr_ch);
+        INSTRUMENTATION_MARK_RESET(TR_CH_SCORES);
         if (!script_ok) { cache_err = err; return; }
         const char *p = out.c_str();
         char *end;
@@ -2290,11 +2295,14 @@ static void handle_replay(int fd, const Cfg &cfg, Shared *sh,
             poll(nullptr, 0, ms > 100 ? 100 : (ms < 1 ? 1 : ms));
             continue;
         }
-        if (!r.next(frame, err)) {
-            if (!err.empty()) return;        // damaged file: end the stream
-            r.rewind();                      // clean end of clip: loop
-            if (!r.next(frame, err)) return; // no video chunks at all
+        INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.clip_read, 0);
+        bool have = r.next(frame, err);
+        if (!have && err.empty()) { // clean end of clip: loop
+            r.rewind();
+            have = r.next(frame, err);
         }
+        INSTRUMENTATION_MARK_RESET(g_tr_ch);
+        if (!have) return; // damaged file, or no video chunks at all
         INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.stream_send,
                                  (uint32_t)(frame.size() >> 10));
         bool sent = send_part(fd, frame, sh);
@@ -2482,7 +2490,6 @@ static void handle_recording_delete(int fd, const Cfg &cfg, Shared *sh,
 
 static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     TrThreadGuard tr_guard;
-    g_tr_ch = TR_CH_WEB0 + (g_tr_web_seq++ % TR_WEB_LANES);
     timeval tv{5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -2493,9 +2500,12 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     if (read_request(fd, method, path)) {
         std::string route = path.substr(0, path.find('?'));
         // one event per short request; the long-lived streams instrument
-        // their per-frame sends instead
+        // their per-frame sends instead, each on its own lane
         bool traced = !(route == "/stream" || route == "/replay");
-        if (traced) INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.http_req, 0);
+        if (traced)
+            INSTRUMENTATION_MARK_SET(TR_CH_HTTP, g_tr.http_req, 0);
+        else
+            g_tr_ch = TR_CH_STREAM0 + (g_tr_web_seq++ % TR_STREAM_LANES);
         if (method == "GET" && (route == "/" || route == "/index.html"))
             send_simple(fd, sh, "200 OK", "text/html; charset=utf-8", kHtmlPage);
         else if (method == "GET" && route == "/stream")
@@ -2548,7 +2558,7 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             send_str(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", sh);
         else
             send_simple(fd, sh, "404 Not Found", "text/plain", "not found\n");
-        if (traced) INSTRUMENTATION_MARK_RESET(g_tr_ch);
+        if (traced) INSTRUMENTATION_MARK_RESET(TR_CH_HTTP);
     }
     st->client_done(fd); // deregister first, then close (avoids fd-reuse race)
     close(fd);
@@ -2813,6 +2823,7 @@ int main(int argc, char **argv) {
     g_tr.http_req = INSTRUMENTATION_MARK_ADD("http_request");
     g_tr.stream_send = INSTRUMENTATION_MARK_ADD("stream_frame_send");
     g_tr.scores_py = INSTRUMENTATION_MARK_ADD("scores_python");
+    g_tr.clip_read = INSTRUMENTATION_MARK_ADD("clip_read_sd");
 
     if (cfg.mjpeg_file.empty() && access(cfg.device.c_str(), F_OK) != 0) {
         std::fprintf(stderr, "%s not found — is the camera plugged in?\n",
@@ -2868,7 +2879,7 @@ int main(int argc, char **argv) {
     if (http.joinable()) http.join(); // unblocks + waits for web clients
     if (sh.save_busy) std::printf("finishing save ...\n");
     sh.join_saver();
-    INSTRUMENTATION_ADD_NUM_CHANNELS(TR_CH_WEB0 + TR_WEB_LANES);
+    INSTRUMENTATION_ADD_NUM_CHANNELS(TR_CH_STREAM0 + TR_STREAM_LANES);
     INSTRUMENTATION_END();
     for (const auto &m : sh.msgs.drain()) std::printf("  %s\n", m.c_str());
     return rc;

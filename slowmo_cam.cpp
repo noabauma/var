@@ -180,6 +180,8 @@ struct Cfg {
     std::string mjpeg_file;       // test input: raw .mjpeg stream instead of camera
     int max_clips = 20;           // keep at most N saved clips (0 = unlimited)
     int http_port = 8080;         // web live view / control (0 = disabled)
+    std::string http_bind = "0.0.0.0"; // 127.0.0.1 = reachable only through a
+                                       // local reverse proxy / ssh tunnel
     int http_fps = 30;            // default live-stream rate served to browsers
     std::string scores_script = "~/src/var/score_function/compute_scores.py";
     std::string scores_file;      // tournament state; default <out_dir>/tournament.tsv
@@ -212,6 +214,8 @@ static void usage(const char *argv0) {
         "  --mjpeg-file PATH    read frames from a raw .mjpeg file instead of a\n"
         "                       camera (testing; frames must match --width/--height)\n"
         "  --port N             web live view + control port (default 8080, 0 = off)\n"
+        "  --bind ADDR          web listener address (default 0.0.0.0 = whole LAN;\n"
+        "                       127.0.0.1 = local proxy/tunnel only)\n"
         "  --http-fps N         live-stream rate served to browsers (default 30;\n"
         "                       clients may lower it per-connection via /stream?fps=N)\n"
         "  --scores-script PATH python bridge computing the tournament scores\n"
@@ -247,6 +251,7 @@ static bool parse_args(int argc, char **argv, Cfg &cfg) {
         else if (a == "--mjpeg-file") { if (!(v = need(i))) return false; cfg.mjpeg_file = v; }
         else if (a == "--max-clips") { if (!(v = need(i))) return false; cfg.max_clips = atoi(v); }
         else if (a == "--port") { if (!(v = need(i))) return false; cfg.http_port = atoi(v); }
+        else if (a == "--bind") { if (!(v = need(i))) return false; cfg.http_bind = v; }
         else if (a == "--http-fps") { if (!(v = need(i))) return false; cfg.http_fps = atoi(v); }
         else if (a == "--scores-script") { if (!(v = need(i))) return false; cfg.scores_script = v; }
         else if (a == "--scores-file") { if (!(v = need(i))) return false; cfg.scores_file = v; }
@@ -2576,7 +2581,12 @@ static void http_server_thread(Cfg cfg, Shared *sh, HttpState *st) {
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (inet_pton(AF_INET, cfg.http_bind.c_str(), &addr.sin_addr) != 1) {
+        sh->msgs.push("web: bad --bind address \"" + cfg.http_bind +
+                      "\" — live view disabled");
+        close(lfd);
+        return;
+    }
     addr.sin_port = htons((uint16_t)cfg.http_port);
     if (bind(lfd, (sockaddr *)&addr, sizeof addr) != 0 || listen(lfd, 16) != 0) {
         char m[160];
@@ -2588,12 +2598,19 @@ static void http_server_thread(Cfg cfg, Shared *sh, HttpState *st) {
     }
     st->listen_fd = lfd;
     {
-        std::string ip = lan_ip();
         char m[256];
-        std::snprintf(m, sizeof m, "live view: http://%s:%d  (via ssh: "
-                      "ssh -L %d:localhost:%d <pi>, then http://localhost:%d)",
-                      ip.empty() ? "<pi-ip>" : ip.c_str(), cfg.http_port,
-                      cfg.http_port, cfg.http_port, cfg.http_port);
+        if (cfg.http_bind != "0.0.0.0") {
+            std::snprintf(m, sizeof m, "live view: http://%s:%d (bound to %s "
+                          "— only a local proxy or ssh tunnel can reach it)",
+                          cfg.http_bind.c_str(), cfg.http_port,
+                          cfg.http_bind.c_str());
+        } else {
+            std::string ip = lan_ip();
+            std::snprintf(m, sizeof m, "live view: http://%s:%d  (via ssh: "
+                          "ssh -L %d:localhost:%d <pi>, then http://localhost:%d)",
+                          ip.empty() ? "<pi-ip>" : ip.c_str(), cfg.http_port,
+                          cfg.http_port, cfg.http_port, cfg.http_port);
+        }
         sh->msgs.push(m);
     }
 

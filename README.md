@@ -35,19 +35,42 @@ Clips are saved to `~/recordings/slowmo_YYYYmmdd_HHMMSS.avi`.
 
 ## Live view in the browser (VAR + live cam at the same time)
 
-The recorder itself serves a web page — start `./slowmo_cam` and open:
-
-```
-http://<pi-ip>:8080          # any browser on the same network
-```
-
-Or, when you're connected over SSH, tunnel it (run on your laptop):
+The recorder itself serves a web page. Since 2026-07-10 it sits behind an
+nginx reverse proxy that adds **HTTPS + a password**, so start it bound to
+localhost and open the https URL:
 
 ```bash
-ssh -L 8080:localhost:8080 noabauma@<pi-ip>   # then open http://localhost:8080
+./slowmo_cam --bind 127.0.0.1 --port 8081
 ```
 
-(In an already-open SSH session: press `~C` then type `-L 8080:localhost:8080`.)
+```
+https://<pi-ip>/             # any browser on the same network
+```
+
+Log in as user **billiardino** (password: see `~/slowmo-cam-password.txt` on
+the Pi). The certificate is self-signed, so every device shows a warning
+*once* — "Advanced → proceed" accepts it; the connection is encrypted either
+way. Old `http://…:8080` bookmarks redirect to the https page.
+
+Or, when you're connected over SSH, tunnel straight to the recorder — the
+tunnel is already encrypted and your SSH key is the authentication:
+
+```bash
+ssh -L 8081:localhost:8081 noabauma@<pi-ip>   # then open http://localhost:8081
+```
+
+(In an already-open SSH session: press `~C` then type `-L 8081:localhost:8081`.)
+
+**How the pieces fit:** the recorder only listens on `127.0.0.1:8081`
+(`--bind`), so nothing on the LAN or VPN can reach it directly — nginx
+(`/etc/nginx/sites-available/slowmo-cam`) terminates TLS on 443 with the
+cert in `/etc/ssl/slowmo-cam/` (valid to 2036) and checks credentials
+against `/etc/nginx/slowmo.htpasswd`.
+
+**Changing the password:** run `./set-web-password.sh`. Note that
+`~/slowmo-cam-password.txt` is only a plain-text *note* — the password that
+is actually checked is the hash in `/etc/nginx/slowmo.htpasswd`, and the
+script updates both (plus reloads nginx).
 
 The page shows the **live camera**, a status bar (fps / buffer / drops), and
 three buttons — **Save + replay** (same as pressing `s`), **Replay last**,
@@ -133,8 +156,16 @@ on the page; not persisted — a restart returns to 0.85).
 Options: `--scores-file PATH`, `--scores-script PATH`, `--no-scores`.
 Needs `python3` + `numpy` (already on the Pi).
 
-**Headless / kiosk use:** without a terminal the program keeps recording and
-serves the web controls (`nohup ./slowmo_cam >/tmp/slowmo.log 2>&1 &`).
+**Headless / autostart:** the recorder runs as a systemd service
+(`/etc/systemd/system/slowmo-cam.service`) that starts on boot, retries
+every 5 s until the camera is ready, and restarts on crashes — together
+with nginx the whole stack survives a power cycle unattended.
+
+```bash
+sudo systemctl status slowmo-cam     # is it running?
+sudo systemctl restart slowmo-cam    # e.g. after `make`
+journalctl -u slowmo-cam -f          # live logs
+```
 
 ## Why this is much faster than the Python version
 

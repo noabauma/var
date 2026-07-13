@@ -141,6 +141,9 @@ ffmpeg -f lavfi -i testsrc2=duration=4:rate=60:size=1280x720 -c:v mjpeg -f mjpeg
   `v4l2-ctl -d /dev/video0 --list-formats-ext`, request a real mode.
 - **`drops` climbing** — USB losing frames: shorter cable / lower fps.
 - **no camera** — page shows "no camera", video resumes on plug-in.
+- **TV score display goes black** — X blanking/DPMS is disabled on this Pi
+  (`xserver-command=X -s 0 -dpms` in `/etc/lightdm/lightdm.conf`); if the
+  TV still sleeps, it's the TV's own eco/sleep timer or HDMI-CEC setting.
 - **profiling** — `make tracr` builds an instrumented binary (TraCR);
   `~/src/tracr/build/tracr_process tracr/tracr perfetto` → ui.perfetto.dev.
 

@@ -1738,9 +1738,13 @@ h1{font-size:16px;margin:0;font-weight:600}
 #st{margin-left:auto;font-variant-numeric:tabular-nums;color:#8b96a5;font-size:13px}
 main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10px;gap:14px}
 #wrap{position:relative;width:100%;max-width:1280px}
-#recs{width:100%;max-width:720px;margin:0 auto 8px;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
+#brow{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap;justify-content:center;max-width:1880px;margin:0 auto 8px;padding:0 14px;box-sizing:border-box}
+#recs,#setup,#rules{flex:1 1 340px;max-width:620px;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
+#setup ul,#rules ul{margin:0;padding-left:18px}
+#setup li,#rules li{margin:5px 0;color:#aeb9c7;font-size:13px;line-height:1.45}
+#setup a{color:#3b82f6}
 #scorepane{flex:none;width:360px;max-height:min(72vh,720px);overflow-y:auto;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
-#recs h2,#scorepane h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:2px 0 8px}
+#recs h2,#scorepane h2,#setup h2,#rules h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:2px 0 8px}
 .rit{padding:6px;border-radius:8px;cursor:pointer}
 .rit:hover,.rit.on{background:#141a21}
 .rit .nm{font-size:13px;color:#dfe6ee;word-break:break-all;display:flex;align-items:center;gap:4px}
@@ -1797,7 +1801,7 @@ button:disabled{opacity:.4;cursor:default}
 #tf input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;flex:1;min-width:8em}
 #tf button{padding:9px 14px}
 #board h3{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:20px 0 6px}
-#h2hwide{width:calc(100vw - 28px);max-width:1280px;position:relative;left:50%;transform:translateX(-50%)}
+#h2hwide{width:calc(100vw - 28px);max-width:1600px;position:relative;left:50%;transform:translateX(-50%)}
 #h2h{display:flex;gap:24px;align-items:center;justify-content:center;flex-wrap:wrap}
 #vswrap{overflow-x:auto;flex:0 1 auto;min-width:0}
 #gwrap{flex:0 1 520px;min-width:320px;max-width:560px}
@@ -1820,8 +1824,9 @@ button:disabled{opacity:.4;cursor:default}
 table.vs th{cursor:default}
 table.vs thead th:hover,table.vs tbody th:hover{color:#fff}
 #board table.vs{width:auto;font-size:13px}
-#board table.vs th,#board table.vs td{text-align:center;padding:4px 8px;border:1px solid #1c2530;min-width:26px;width:auto;color:#dfe6ee}
+#board table.vs th,#board table.vs td{text-align:center;padding:4px 6px;border:1px solid #1c2530;min-width:26px;width:auto;color:#dfe6ee}
 #board table.vs thead th{color:#8b96a5;font-size:12px}
+#board table.vs thead th:not(:first-child):not(.tot){writing-mode:vertical-rl;transform:rotate(180deg);text-align:left;padding:6px 3px;white-space:nowrap}
 #board table.vs tbody th{color:#aeb9c7;font-size:12px;text-align:right;white-space:nowrap}
 #board table.vs td.win{color:#81c784;font-weight:700}
 #board table.vs td.z{color:#3b4652}
@@ -1889,7 +1894,32 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </div>
 </div>
 </section>
+<div id="brow">
 <aside id="recs"><h2>Recordings</h2><div id="rlist"></div></aside>
+<aside id="setup"><h2>Setup</h2><ul>
+<li>2 players per team (1 reserve player allowed). Idea: reserve players could form their own teams for more competition. If a player is missing, we can reschedule the match.</li>
+<li>First, we play a round-robin tournament, followed by a knockout bracket of the 8 best teams. If there are more than 14 teams, we'll switch to group-based round-robins.</li>
+<li>The scores are based on a PageRank algorithm (<a href="https://onebox.huawei.com/p/a10f2a69c808860e21e3f74fd8537490" target="_blank" rel="noopener">see the code here</a>).</li>
+<li>Each match is played as a best-of-three (first team to win 2 games).</li>
+<li>A game is made up of rounds and is won by the first team to score 10 goals/points. There will be no deuce &mdash; no need to win by two; first to 10 takes the game.</li>
+<li>A round is won when a goal is scored.</li>
+<li>There will be prizes for the top 3 teams.</li>
+<li>The default playtime is during lunch, 12:00&ndash;13:00 (but we expect you to arrange your own playtimes, since not everyone can play at lunch).</li>
+<li>A warm-up before a match is allowed.</li>
+</ul></aside>
+<aside id="rules"><h2>Rules</h2><ul>
+<li>Scoring with the middle row (the 5-bar) is allowed, but not on the first touch of the round: the ball must first bounce off another player or a wall.</li>
+<li>A rod/figure may not rotate more than 360&deg; before hitting the ball, nor more than 360&deg; after hitting it. The "before" and "after" rotations are judged separately and are not added together.</li>
+<li>Jarring is NOT allowed.</li>
+<li>Dribbling and passing between your own players in any direction is allowed.</li>
+<li>If the ball enters the goal but pops back out, it still counts as a goal. If it's unclear whether it went in, the round is restarted.</li>
+<li>If the ball comes to a stop where it can't be reached (a dead ball), either re-serve it as usual or reposition it: place it in the corner if it's stuck behind the last attacker, otherwise at the center.</li>
+<li>At the start of each round, the ball is served through the designated serve holes. Adding spin on the serve is allowed, but only for the team that just lost the point.</li>
+<li>You may switch positions during a match (defender &harr; attacker).</li>
+<li>Play fair, everything is trust based.</li>
+<li>After each goal, the team that conceded serves next and may place the ball (yellow or white) on their 5-bar or in the serve hole.</li>
+</ul></aside>
+</div>
 <div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>f</kbd> fullscreen&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
 <script>
 const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');

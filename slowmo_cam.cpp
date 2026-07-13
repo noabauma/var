@@ -1737,10 +1737,10 @@ header{display:flex;align-items:baseline;gap:12px;padding:10px 16px}
 h1{font-size:16px;margin:0;font-weight:600}
 #st{margin-left:auto;font-variant-numeric:tabular-nums;color:#8b96a5;font-size:13px}
 main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10px;gap:14px}
-main::before{content:"";flex:none;width:250px} /* balances #recs so the cam stays centered */
 #wrap{position:relative;width:100%;max-width:1280px}
 #recs{flex:none;width:250px;max-height:min(72vh,720px);overflow-y:auto;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
-#recs h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:2px 0 8px}
+#scorepane{flex:none;width:300px;max-height:min(72vh,720px);overflow-y:auto;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
+#recs h2,#scorepane h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:2px 0 8px}
 .rit{padding:6px;border-radius:8px;cursor:pointer}
 .rit:hover,.rit.on{background:#141a21}
 .rit .nm{font-size:13px;color:#dfe6ee;word-break:break-all;display:flex;align-items:center;gap:4px}
@@ -1748,7 +1748,9 @@ main::before{content:"";flex:none;width:250px} /* balances #recs so the cam stay
 .rit .keep{color:#e5c07b}
 .rit .meta{font-size:11px;color:#5c6672;margin-top:2px}
 #rnone{color:#5c6672;font-size:12px}
-@media(max-width:1000px){main{flex-direction:column}main::before{display:none}#recs{width:100%;max-width:1280px;max-height:38vh}}
+@media(max-width:1279px){main{flex-direction:column}#wrap{order:-1}
+#scorepane{order:1;width:100%;max-width:1280px;max-height:none}
+#recs{order:2;width:100%;max-width:1280px;max-height:38vh}}
 #cam{width:100%;display:block;border-radius:10px;background:#000;aspect-ratio:16/9;object-fit:contain}
 #badge{position:absolute;top:12px;left:12px;background:#c0231d;color:#fff;font-weight:700;padding:4px 12px;border-radius:6px;letter-spacing:1px;font-size:13px;animation:p 1s infinite}
 #fs{position:absolute;top:12px;right:12px;display:flex;align-items:center;background:rgba(11,14,18,.55);border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:8px;line-height:0;opacity:.65}
@@ -1763,23 +1765,23 @@ button:disabled{opacity:.4;cursor:default}
 #save{background:#b3261e;color:#fff}
 #board{max-width:720px;margin:0 auto;padding:0 14px 8px;width:100%;box-sizing:border-box}
 #board h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase}
-#board table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-#board th,#board td{text-align:left;padding:6px 8px;border-bottom:1px solid #1c2530}
-#board th{color:#5c6672;font-size:12px}
-#board td:first-child,#board th:first-child{width:2em;color:#5c6672}
-#board td:nth-child(n+3),#board th:nth-child(n+3){text-align:right}
+#board table,#scorepane table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+#board th,#board td,#scorepane th,#scorepane td{text-align:left;padding:6px 8px;border-bottom:1px solid #1c2530}
+#board th,#scorepane th{color:#5c6672;font-size:12px}
+#board td:first-child,#board th:first-child,#scorepane td:first-child,#scorepane th:first-child{width:2em;color:#5c6672}
+#board td:nth-child(n+3),#board th:nth-child(n+3),#scorepane td:nth-child(n+3),#scorepane th:nth-child(n+3){text-align:right}
 #af{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
 #af input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;min-width:8em;flex:1}
 #af button{padding:9px 14px}
 #serr{color:#e57373;font-size:13px;min-height:1.2em;margin-top:6px}
 #algsw{display:flex;gap:8px;margin-bottom:10px}
-#algsw button{padding:7px 12px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
+#algsw button{flex:1;padding:7px 8px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
 #algsw button.on{background:#1c2530;border-color:#3b82f6;color:#fff}
 #dctl{display:flex;gap:10px;align-items:center;margin-bottom:10px;font-size:13px;color:#8b96a5}
 #dctl input{flex:1;max-width:240px;margin:0;accent-color:#3b82f6}
 #dctl b{color:#dfe6ee;font-variant-numeric:tabular-nums;min-width:2.6em}
-#board tbody tr{cursor:pointer}
-#board tbody tr:hover td,#board tr.sel td{background:#141a21}
+#scorepane tbody tr{cursor:pointer}
+#scorepane tbody tr:hover td,#scorepane tr.sel td{background:#141a21}
 #detail{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:12px;margin-top:10px;font-size:14px}
 .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .xbtn{background:none;padding:2px 8px}
@@ -1831,6 +1833,19 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </style>
 <header><h1>slowmo-cam</h1><span id="st">connecting&hellip;</span></header>
 <main>
+<aside id="scorepane">
+<h2>Tournament</h2>
+<div id="algsw">
+<button id="algb" class="on">Bias PageRank</button>
+<button id="algp">Classic PageRank</button>
+</div>
+<div id="dctl" title="PageRank damping: how much of the score comes from match results (d) vs. the baseline (1−d)">
+<span>damping d</span>
+<input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">
+<b id="dval">0.85</b>
+</div>
+<table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
+</aside>
 <div id="wrap"><img id="cam" src="/stream" alt="live"><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
 <aside id="recs"><h2>Recordings</h2><div id="rlist"></div></aside>
 </main>
@@ -1846,17 +1861,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </select>
 </footer>
 <section id="board">
-<h2>Tournament</h2>
-<div id="algsw">
-<button id="algb" class="on">Bias PageRank</button>
-<button id="algp">Classic PageRank</button>
-</div>
-<div id="dctl" title="PageRank damping: how much of the score comes from match results (d) vs. the baseline (1−d)">
-<span>damping d</span>
-<input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">
-<b id="dval">0.85</b>
-</div>
-<table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
+<h2>Manage tournament</h2>
 <div id="detail" hidden></div>
 <form id="af">
 <input id="ta" list="tlist" placeholder="team A" maxlength="40" required autocomplete="off">

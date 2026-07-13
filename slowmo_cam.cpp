@@ -321,6 +321,11 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         return q_.empty() ? nullptr : q_.back();
     }
+    void clear() { // privacy switch: drop all buffered footage
+        std::lock_guard<std::mutex> lk(m_);
+        q_.clear();
+        stamps_.clear();
+    }
 
 private:
     mutable std::mutex m_;
@@ -355,7 +360,8 @@ struct Shared {
     MessageQueue msgs;
     ScoreBoard *scores = nullptr; // web scoreboard (null = disabled)
     std::atomic<bool> alive{true};
-    std::atomic<bool> cam_ok{false}; // camera currently streaming
+    std::atomic<bool> cam_ok{false};      // camera currently streaming
+    std::atomic<bool> cam_enabled{true};  // web privacy switch (OFF = no capture)
     std::atomic<int> viewers{0};     // browsers currently receiving video
     std::atomic<bool> save_busy{false};
     std::atomic<bool> interactive{false};
@@ -1041,7 +1047,7 @@ static bool v4l2_capture_once(const Cfg &cfg, Shared *sh, std::string &err) {
 
     uint32_t expected_seq = 0;
     bool have_seq = false;
-    while (sh->alive && !g_stop) {
+    while (sh->alive && !g_stop && sh->cam_enabled) {
         pollfd p{fd, POLLIN, 0};
         int r = poll(&p, 1, 200);
         if (r < 0) {
@@ -1064,7 +1070,8 @@ static bool v4l2_capture_once(const Cfg &cfg, Shared *sh, std::string &err) {
         INSTRUMENTATION_MARK_SET(TR_CH_CAPTURE, g_tr.frame_ingest,
                                  b.bytesused >> 10);
         // skip broken frames some UVC cams emit right after stream start
-        if (b.bytesused > 4 && d[0] == 0xFF && d[1] == 0xD8) {
+        // (and stop storing the moment the privacy switch flips)
+        if (b.bytesused > 4 && d[0] == 0xFF && d[1] == 0xD8 && sh->cam_enabled) {
             sh->ring.push(std::make_shared<FrameData>(d, d + b.bytesused));
             if (have_seq && b.sequence != expected_seq)
                 sh->drops += b.sequence - expected_seq;
@@ -1091,10 +1098,20 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
     TrThreadGuard tr_guard;
     bool announced = false;
     while (sh->alive && !g_stop) {
+        if (!sh->cam_enabled) { // privacy switch: device stays closed
+            poll(nullptr, 0, 100);
+            continue;
+        }
         std::string err;
         bool clean = v4l2_capture_once(cfg, sh, err);
         bool was_streaming = sh->cam_ok.exchange(false);
-        if (clean) break;
+        if (clean) {
+            if (!sh->cam_enabled && sh->alive && !g_stop) {
+                sh->ring.clear(); // capture has stopped: no frame can slip in
+                continue;         // paused — wait for the switch
+            }
+            break; // shutdown
+        }
         if (was_streaming || !announced) {
             sh->msgs.push("camera unavailable (" + err +
                           ") — retrying every 2 s; the web page stays up");
@@ -1815,6 +1832,9 @@ main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10p
 #scorepane{order:1;width:100%;max-width:1280px;max-height:none}}
 #cam{width:100%;display:block;border-radius:10px;background:#000;aspect-ratio:16/9;object-fit:contain}
 #badge{position:absolute;top:12px;left:12px;background:#c0231d;color:#fff;font-weight:700;padding:4px 12px;border-radius:6px;letter-spacing:1px;font-size:13px;animation:p 1s infinite}
+#privacy{position:absolute;inset:0;background:#0b0e12;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:26px;font-weight:700;color:#8b96a5}
+#privacy span{font-size:14px;font-weight:400;color:#5c6672}
+#camtoggle.off{background:#5c1f1c;color:#fbb}
 #fs{position:absolute;top:12px;right:12px;display:flex;align-items:center;background:rgba(11,14,18,.55);border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:8px;line-height:0;opacity:.65}
 #fs:hover{opacity:1}
 #wrap:fullscreen{max-width:none;background:#000}
@@ -1912,12 +1932,13 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 </aside>
-<div id="wrap"><img id="cam" src="/stream" alt="live"><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
+<div id="wrap"><img id="cam" src="/stream" alt="live"><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
 </main>
 <footer>
 <button id="save">&#128308; Save + replay</button>
 <button id="again" disabled>&#8635; Replay last</button>
 <button id="live">&#9679; Live</button>
+<button id="camtoggle" title="privacy switch: OFF stops capturing and clears the buffer">&#128247; &hellip;</button>
 <select id="rate" title="live-stream rate — pick a lower one on slow connections (VPN, weak WiFi) for a smooth picture">
 <option value="">30 fps</option>
 <option value="15">15 fps</option>
@@ -2003,6 +2024,9 @@ $('save').onclick=async()=>{$('save').disabled=true;
 $('again').onclick=()=>{if(replayFrames)replay(replayFrames/playFps);
   else if(recs.length)replayRec(recs[0].name,recs[0].fps>0?recs[0].frames/recs[0].fps:0);};
 $('live').onclick=live;cam.onclick=live;
+$('camtoggle').onclick=async()=>{
+ if(camOn&&!confirm('Turn the camera OFF? Capturing stops and the replay buffer is cleared.'))return;
+ try{await fetch('/camera?on='+(camOn?0:1),{method:'POST'});}catch(e){}};
 $('rate').value=localStorage.getItem('streamfps')||'';
 $('rate').onchange=e=>{localStorage.setItem('streamfps',e.target.value);
   if(badge.hidden)live();};
@@ -2018,7 +2042,11 @@ cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
 (async function poll(){try{const s=await(await fetch('/status')).json();
   replayFrames=s.replay_frames;playFps=s.playback_fps;slow=Math.round(s.capture_fps/s.playback_fps);
   updAgain();
-  st.textContent=(s.camera===false?'⚠ no camera — plug it in, video resumes automatically':s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'%')+' · drops '+s.drops+' · 👁 '+s.viewers+(s.save_busy?' · saving…':'');
+  camOn=s.cam_on!==false;
+  $('camtoggle').textContent=camOn?'📷 Camera ON':'📷 Camera OFF';
+  $('camtoggle').className=camOn?'':'off';
+  $('privacy').hidden=camOn||!badge.hidden;
+  st.textContent=(!camOn?'📷 camera off (privacy)':s.camera===false?'⚠ no camera — plug it in, video resumes automatically':s.fps.toFixed(0)+' fps · buffer '+s.buffer_pct+'%')+' · drops '+s.drops+' · 👁 '+s.viewers+(s.save_busy?' · saving…':'');
 }catch(e){st.textContent='⚠ connection lost';}setTimeout(poll,1000);})();
 function fmtWhen(t){const d=new Date(t*1000),p=n=>String(n).padStart(2,'0');
  return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}
@@ -2059,7 +2087,7 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
 async function recsPoll(){try{const r=await(await fetch('/recordings')).json();
  if(r.ok){recs=r.files;renderRecs();updAgain();}}catch(e){}}
 recsPoll();setInterval(recsPoll,15000);
-let S=null,alg='bias',selTeam=-1,gHl=null,gHlOff=null;
+let S=null,alg='bias',selTeam=-1,gHl=null,gHlOff=null,camOn=true;
 const enc=encodeURIComponent;
 async function post(u){try{const r=await(await fetch(u,{method:'POST'})).json();
  if(!r.ok){$('serr').textContent=r.error;return false;}
@@ -2508,6 +2536,11 @@ static void handle_replay(int fd, const Cfg &cfg, Shared *sh,
 }
 
 static void handle_save(int fd, const Cfg &cfg, Shared *sh) {
+    if (!sh->cam_enabled) {
+        send_simple(fd, sh, "409 Conflict", "application/json",
+                    "{\"ok\":false,\"error\":\"camera is switched off\"}");
+        return;
+    }
     std::string path;
     auto snap = save_now(cfg, *sh, &path);
     if (!snap) {
@@ -2530,12 +2563,13 @@ static void handle_status(int fd, const Cfg &cfg, Shared *sh) {
     auto snap = sh->get_last_snap();
     char body[512];
     std::snprintf(body, sizeof body,
-                  "{\"camera\":%s,\"viewers\":%d,\"fps\":%.1f,"
+                  "{\"camera\":%s,\"cam_on\":%s,\"viewers\":%d,\"fps\":%.1f,"
                   "\"buffer_pct\":%zu,\"frames\":%zu,"
                   "\"drops\":%llu,\"save_busy\":%s,\"last_clip\":\"%s\","
                   "\"replay_frames\":%zu,\"capture_fps\":%d,"
                   "\"playback_fps\":%d,\"buffer_seconds\":%.1f}",
-                  sh->cam_ok ? "true" : "false", sh->viewers.load(),
+                  sh->cam_ok ? "true" : "false",
+                  sh->cam_enabled ? "true" : "false", sh->viewers.load(),
                   sh->ring.measured_fps(), fill, sh->ring.size(),
                   (unsigned long long)sh->drops.load(),
                   sh->save_busy ? "true" : "false",
@@ -2716,6 +2750,19 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_recording_rename(fd, cfg, sh, path);
         else if (method == "POST" && route == "/recordings/delete")
             handle_recording_delete(fd, cfg, sh, path);
+        else if (method == "POST" && route == "/camera") {
+            bool on = query_str(path, "on") == "1";
+            bool was = sh->cam_enabled.exchange(on);
+            if (!on && was) {
+                sh->ring.clear(); // privacy: footage before OFF is gone too
+                sh->msgs.push("camera switched OFF from the web page (buffer cleared)");
+            } else if (on && !was) {
+                sh->msgs.push("camera switched ON from the web page");
+            }
+            send_simple(fd, sh, "200 OK", "application/json",
+                        on ? "{\"ok\":true,\"cam_on\":true}"
+                           : "{\"ok\":true,\"cam_on\":false}");
+        }
         else if (method == "GET" && route == "/status")
             handle_status(fd, cfg, sh);
         else if (method == "GET" && route == "/scores")

@@ -53,6 +53,12 @@ On the page: live view, status bar (fps / buffer / drops / 👁 viewer count),
 **recordings panel** (click to replay a clip, ✎ rename = keep forever,
 🗑 delete). Keys: `space` save, `r` replay, `f` fullscreen, `l`/`esc` live.
 
+**📷 Camera ON/OFF (privacy switch):** anyone can pause recording from the
+page. OFF truly stops capture — the V4L2 device is closed, the ring buffer
+is wiped (nothing from before the press can be saved), `/save` is refused,
+and the video area shows "Camera is OFF". ON brings it back in ~2 s.
+Saved clips on disk are not affected. `POST /camera?on=0|1`.
+
 **Slow link (VPN/weak WiFi)?** The full stream is ~24 Mbit/s. Pick a lower
 rate in the **fps selector** next to Live (remembered per browser); slow
 viewers also self-adapt server-side to fresh-not-stale frames.

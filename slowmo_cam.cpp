@@ -36,6 +36,7 @@
 //   ./slowmo_cam --help            # all options
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -1252,6 +1253,8 @@ struct ScoreBoard {
     std::string file;   // TSV persistence
     std::string script; // compute_scores.py
     std::vector<std::string> teams;
+    // per team: player 1, player 2, reserve — any slot may be empty
+    std::vector<std::array<std::string, 3>> players;
     std::vector<Match> matches;
     std::vector<double> cache_bias, cache_plain; // per-team; empty = stale
     std::string cache_err;
@@ -1279,6 +1282,7 @@ struct ScoreBoard {
             if (teams[i] == name) return (int)i;
         if (teams.size() >= kMaxTeams) return -1;
         teams.push_back(name);
+        players.push_back({});
         return (int)teams.size() - 1;
     }
 
@@ -1380,8 +1384,13 @@ struct ScoreBoard {
         FILE *fh = std::fopen(tmp.c_str(), "w");
         if (!fh) { err = errno_str("open " + tmp); return false; }
         bool ok = true;
-        for (const auto &t : teams)
-            ok = ok && std::fprintf(fh, "team\t%s\n", t.c_str()) > 0;
+        for (size_t i = 0; i < teams.size(); i++) {
+            const auto &pl = players[i];
+            ok = ok && std::fprintf(fh, "team\t%s\t%s\t%s\t%s\n", teams[i].c_str(),
+                                    pl[0].empty() ? "-" : pl[0].c_str(),
+                                    pl[1].empty() ? "-" : pl[1].c_str(),
+                                    pl[2].empty() ? "-" : pl[2].c_str()) > 0;
+        }
         for (const auto &mt : matches) {
             std::string g = games_str(mt);
             ok = ok && std::fprintf(fh, "match\t%d\t%d\t%s\t%d\n", mt.a, mt.b,
@@ -1409,11 +1418,27 @@ struct ScoreBoard {
                 while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
                     s.pop_back();
                 if (s.compare(0, 5, "team\t") == 0) {
-                    std::string nm = sanitize_name(s.substr(5));
-                    if (teams.size() < kMaxTeams) // placeholder keeps indices stable
+                    // team\tname[\tplayer1\tplayer2\treserve]  ("-" = empty)
+                    std::vector<std::string> f;
+                    size_t pos = 5;
+                    while (f.size() < 4) {
+                        size_t tab = s.find('\t', pos);
+                        f.push_back(s.substr(pos, tab == std::string::npos
+                                                      ? tab : tab - pos));
+                        if (tab == std::string::npos) break;
+                        pos = tab + 1;
+                    }
+                    std::string nm = sanitize_name(f[0]);
+                    if (teams.size() < kMaxTeams) { // placeholder keeps indices stable
                         teams.push_back(nm.empty()
                                             ? "Team " + std::to_string(teams.size() + 1)
                                             : nm);
+                        std::array<std::string, 3> pl{};
+                        for (size_t k = 0; k < 3; k++)
+                            if (k + 1 < f.size() && f[k + 1] != "-")
+                                pl[k] = sanitize_name(f[k + 1]);
+                        players.push_back(pl);
+                    }
                 } else if (s.compare(0, 6, "match\t") == 0) {
                     int a = -1, b = -1, w = -1;
                     char gbuf[192] = {0};
@@ -1450,7 +1475,10 @@ struct ScoreBoard {
             {0, 0, 0, 1, 0, 0, 0, 0, 0}, {0, 0, 0, 1, 0, 0, 0, 0, 0},
             {0, 0, 0, 0, 0, 0, 0, 0, 0}};
         for (int i = 0; i < 9; i++)
+        {
             teams.push_back("Team " + std::to_string(i + 1));
+            players.push_back({});
+        }
         for (int i = 0; i < 9; i++)
             for (int j = 0; j < 9; j++)
                 if (demo[i][j]) // plausible fake best-of-three (2-0) for the demo
@@ -1527,8 +1555,16 @@ struct ScoreBoard {
             if (i) j += ',';
             j += "{\"name\":\"";
             json_escape(j, teams[i]);
+            j += "\",\"players\":[";
+            for (size_t k = 0; k < 3; k++) {
+                if (k) j += ',';
+                j += '"';
+                json_escape(j, players[i][k]);
+                j += '"';
+            }
+            j += "]";
             std::snprintf(buf, sizeof buf,
-                          "\",\"bias\":%.6f,\"plain\":%.6f,\"wins\":%d,\"losses\":%d}",
+                          ",\"bias\":%.6f,\"plain\":%.6f,\"wins\":%d,\"losses\":%d}",
                           cache_bias[i], cache_plain[i], wins[i], losses[i]);
             j += buf;
         }
@@ -1639,7 +1675,9 @@ struct ScoreBoard {
         return true;
     }
 
-    bool add_team(const std::string &raw, std::string &err) {
+    bool add_team(const std::string &raw, const std::string &p1,
+                  const std::string &p2, const std::string &res,
+                  std::string &err) {
         std::string nm = sanitize_name(raw);
         if (nm.empty()) { err = "team name required"; return false; }
         std::lock_guard<std::mutex> lk(m);
@@ -1653,9 +1691,29 @@ struct ScoreBoard {
             return false;
         }
         teams.push_back(nm);
+        players.push_back({sanitize_name(p1), sanitize_name(p2),
+                           sanitize_name(res)});
         cache_bias.clear(); // roster size changes both rankings
         cache_plain.clear();
         return save_locked(err);
+    }
+
+    // set/replace the player names of an existing team (empty clears a slot);
+    // scores are unaffected, so the caches stay valid
+    bool set_players(const std::string &team_raw, const std::string &p1,
+                     const std::string &p2, const std::string &res,
+                     std::string &err) {
+        std::string nm = sanitize_name(team_raw);
+        if (nm.empty()) { err = "team name required"; return false; }
+        std::lock_guard<std::mutex> lk(m);
+        for (size_t i = 0; i < teams.size(); i++)
+            if (teams[i] == nm) {
+                players[i] = {sanitize_name(p1), sanitize_name(p2),
+                              sanitize_name(res)};
+                return save_locked(err);
+            }
+        err = "no team named \"" + nm + "\"";
+        return false;
     }
 
     // Removes the team and every match it played; remaining matches are
@@ -1679,6 +1737,7 @@ struct ScoreBoard {
             if (mt.winner > ti) mt.winner--;
         }
         teams.erase(teams.begin() + ti);
+        players.erase(players.begin() + ti);
         cache_bias.clear();
         cache_plain.clear();
         return save_locked(err);
@@ -1797,7 +1856,7 @@ button:disabled{opacity:.4;cursor:default}
 .rn{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .rn input{font:inherit;background:#0b0e12;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:7px 10px;flex:1;min-width:8em}
 .danger{background:#5c1f1c;color:#fbb}
-#tf{display:flex;gap:8px;margin-top:8px}
+#tf{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
 #tf input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;flex:1;min-width:8em}
 #tf button{padding:9px 14px}
 #board h3{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:20px 0 6px}
@@ -1880,6 +1939,9 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </form>
 <form id="tf">
 <input id="tn" placeholder="new team name" maxlength="40" required autocomplete="off">
+<input id="tp1" placeholder="player 1 (optional)" maxlength="40" autocomplete="off">
+<input id="tp2" placeholder="player 2" maxlength="40" autocomplete="off">
+<input id="tp3" placeholder="reserve" maxlength="40" autocomplete="off">
 <button type="submit">Add team</button>
 </form>
 <div id="serr"></div>
@@ -2010,6 +2072,23 @@ function renderDetail(){const d=$('detail');if(selTeam<0||!S){d.hidden=true;retu
  const nm=document.createElement('b');nm.textContent=me;h.appendChild(nm);
  const x=document.createElement('button');x.textContent='✕';x.className='xbtn';
  x.onclick=()=>{selTeam=-1;renderDetail();};h.appendChild(x);d.appendChild(h);
+ const pl=S.teams[selTeam].players||['','',''];
+ const prow=document.createElement('div');prow.className='mrow';
+ prow.textContent='Players: '+((pl[0]||pl[1])
+  ?[pl[0],pl[1]].filter(Boolean).join(', ')+(pl[2]?' · reserve: '+pl[2]:'')
+  :'— none yet —');
+ d.appendChild(prow);
+ const pf=document.createElement('form');pf.className='rn';
+ const pin=[];
+ ['player 1','player 2','reserve'].forEach((ph,k)=>{
+  const inp=document.createElement('input');inp.maxLength=40;inp.placeholder=ph;
+  inp.value=pl[k]||'';pf.appendChild(inp);pin.push(inp);});
+ const pb=document.createElement('button');pb.textContent='Save players';
+ pf.appendChild(pb);
+ pf.onsubmit=e=>{e.preventDefault();
+  post('/scores/team/players?team='+enc(me)+'&p1='+enc(pin[0].value)
+   +'&p2='+enc(pin[1].value)+'&res='+enc(pin[2].value));};
+ d.appendChild(pf);
  const ms=S.matches.filter(m=>m.a===selTeam||m.b===selTeam);
  if(!ms.length){const p=document.createElement('div');p.className='mrow';
   p.textContent='no matches yet';d.appendChild(p);}
@@ -2126,6 +2205,8 @@ function renderTable(){if(!S)return;
   [r+1,t.name,(t[alg]*100).toFixed(2),t.wins,t.losses].forEach(v=>{
    const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});
   tr.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
+  const tpl=(t.players||[]).filter(Boolean);
+  if(tpl.length)tr.title='Players: '+tpl.join(', ');
   if(ti===selTeam)tr.className='sel';
   tb.appendChild(tr);
   const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
@@ -2150,7 +2231,9 @@ $('af').addEventListener('submit',async e=>{e.preventDefault();
  $('ta').value='';$('tb2').value='';$('tg').value='';scores();}catch(e){}});
 $('undo').onclick=()=>post('/scores/undo');
 $('tf').addEventListener('submit',async e=>{e.preventDefault();
- if(await post('/scores/team/add?name='+enc($('tn').value)))$('tn').value='';});
+ if(await post('/scores/team/add?name='+enc($('tn').value)+'&p1='+enc($('tp1').value)
+  +'&p2='+enc($('tp2').value)+'&res='+enc($('tp3').value)))
+  $('tn').value=$('tp1').value=$('tp2').value=$('tp3').value='';});
 scores();setInterval(scores,10000);
 </script>
 )HTML";
@@ -2645,7 +2728,20 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_scores_undo(fd, sh);
         else if (method == "POST" && route == "/scores/team/add" && sh->scores) {
             std::string err;
-            scores_mutation(fd, sh, sh->scores->add_team(query_str(path, "name"), err), err);
+            scores_mutation(fd, sh,
+                            sh->scores->add_team(query_str(path, "name"),
+                                                 query_str(path, "p1"),
+                                                 query_str(path, "p2"),
+                                                 query_str(path, "res"), err),
+                            err);
+        } else if (method == "POST" && route == "/scores/team/players" && sh->scores) {
+            std::string err;
+            scores_mutation(fd, sh,
+                            sh->scores->set_players(query_str(path, "team"),
+                                                    query_str(path, "p1"),
+                                                    query_str(path, "p2"),
+                                                    query_str(path, "res"), err),
+                            err);
         } else if (method == "POST" && route == "/scores/team/delete" && sh->scores) {
             std::string err;
             scores_mutation(fd, sh, sh->scores->delete_team(query_str(path, "name"), err), err);

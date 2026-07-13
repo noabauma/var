@@ -10,6 +10,9 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=noabauma
+# priority over desktop processes (Chromium TV view etc.) — the capture
+# thread must never wait for a browser tab
+Nice=-10
 WorkingDirectory=/home/noabauma/src/var
 ExecStart=/home/noabauma/src/var/slowmo_cam --bind 127.0.0.1 --port 8081
 Restart=always

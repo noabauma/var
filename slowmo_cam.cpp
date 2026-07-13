@@ -1738,8 +1738,8 @@ h1{font-size:16px;margin:0;font-weight:600}
 #st{margin-left:auto;font-variant-numeric:tabular-nums;color:#8b96a5;font-size:13px}
 main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10px;gap:14px}
 #wrap{position:relative;width:100%;max-width:1280px}
-#recs{flex:none;width:250px;max-height:min(72vh,720px);overflow-y:auto;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
-#scorepane{flex:none;width:300px;max-height:min(72vh,720px);overflow-y:auto;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
+#recs{width:100%;max-width:720px;margin:0 auto 8px;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
+#scorepane{flex:none;width:360px;max-height:min(72vh,720px);overflow-y:auto;background:#0f151c;border:1px solid #1c2530;border-radius:10px;padding:10px 12px;box-sizing:border-box}
 #recs h2,#scorepane h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:2px 0 8px}
 .rit{padding:6px;border-radius:8px;cursor:pointer}
 .rit:hover,.rit.on{background:#141a21}
@@ -1749,8 +1749,7 @@ main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10p
 .rit .meta{font-size:11px;color:#5c6672;margin-top:2px}
 #rnone{color:#5c6672;font-size:12px}
 @media(max-width:1279px){main{flex-direction:column}#wrap{order:-1}
-#scorepane{order:1;width:100%;max-width:1280px;max-height:none}
-#recs{order:2;width:100%;max-width:1280px;max-height:38vh}}
+#scorepane{order:1;width:100%;max-width:1280px;max-height:none}}
 #cam{width:100%;display:block;border-radius:10px;background:#000;aspect-ratio:16/9;object-fit:contain}
 #badge{position:absolute;top:12px;left:12px;background:#c0231d;color:#fff;font-weight:700;padding:4px 12px;border-radius:6px;letter-spacing:1px;font-size:13px;animation:p 1s infinite}
 #fs{position:absolute;top:12px;right:12px;display:flex;align-items:center;background:rgba(11,14,18,.55);border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:8px;line-height:0;opacity:.65}
@@ -1847,7 +1846,6 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 </aside>
 <div id="wrap"><img id="cam" src="/stream" alt="live"><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
-<aside id="recs"><h2>Recordings</h2><div id="rlist"></div></aside>
 </main>
 <footer>
 <button id="save">&#128308; Save + replay</button>
@@ -1888,6 +1886,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </div>
 </div>
 </section>
+<aside id="recs"><h2>Recordings</h2><div id="rlist"></div></aside>
 <div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>f</kbd> fullscreen&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
 <script>
 const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');

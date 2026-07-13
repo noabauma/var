@@ -1798,10 +1798,10 @@ button:disabled{opacity:.4;cursor:default}
 #tf button{padding:9px 14px}
 #board h3{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:20px 0 6px}
 #h2hwide{width:calc(100vw - 28px);max-width:1280px;position:relative;left:50%;transform:translateX(-50%)}
-#h2h{display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap}
-#vswrap{overflow-x:auto;flex:1 1 auto;min-width:0}
-#gwrap{flex:0 1 400px;min-width:280px;max-width:430px}
-#gwrap svg{width:100%;height:auto;display:block}
+#h2h{display:flex;gap:24px;align-items:center;justify-content:center;flex-wrap:wrap}
+#vswrap{overflow-x:auto;flex:0 1 auto;min-width:0}
+#gwrap{flex:0 1 520px;min-width:320px;max-width:560px}
+#gwrap svg{width:100%;height:auto;display:block;overflow:visible}
 #gcap{color:#5c6672;font-size:12px;margin-top:4px}
 #gcap .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 4px 0 10px}
 #gcap .sw:first-child{margin-left:0}
@@ -1815,7 +1815,10 @@ button:disabled{opacity:.4;cursor:default}
 .gn.sel .dot{fill:#3b82f6}
 .gn .hit{fill:transparent}
 .gn text{fill:#aeb9c7;font:11px system-ui,sans-serif}
-.gn:hover .dot,.gn:hover text{fill:#fff}
+.gn:hover .dot,.gn:hover text,.gn.hl .dot,.gn.hl text{fill:#fff}
+.gn.hl .dot{stroke:#3b82f6;stroke-width:3}
+table.vs th{cursor:default}
+table.vs thead th:hover,table.vs tbody th:hover{color:#fff}
 #board table.vs{width:auto;font-size:13px}
 #board table.vs th,#board table.vs td{text-align:center;padding:4px 8px;border:1px solid #1c2530;min-width:26px;width:auto;color:#dfe6ee}
 #board table.vs thead th{color:#8b96a5;font-size:12px}
@@ -1880,7 +1883,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <div id="h2h">
 <div id="vswrap"></div>
 <div id="gwrap">
-<svg id="gsvg" viewBox="0 0 360 360" role="img" aria-label="who beat whom, as a graph"></svg>
+<svg id="gsvg" viewBox="0 0 560 400" role="img" aria-label="who beat whom, as a graph"></svg>
 <div id="gcap"><span class="sw" style="background:#81c784"></span>wins <span class="sw" style="background:#e57373"></span>losses of the hovered team · arrow points at the loser · click selects</div>
 </div>
 </div>
@@ -1964,7 +1967,7 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
 async function recsPoll(){try{const r=await(await fetch('/recordings')).json();
  if(r.ok){recs=r.files;renderRecs();updAgain();}}catch(e){}}
 recsPoll();setInterval(recsPoll,15000);
-let S=null,alg='bias',selTeam=-1;
+let S=null,alg='bias',selTeam=-1,gHl=null,gHlOff=null;
 const enc=encodeURIComponent;
 async function post(u){try{const r=await(await fetch(u,{method:'POST'})).json();
  if(!r.ok){$('serr').textContent=r.error;return false;}
@@ -2020,12 +2023,16 @@ function renderVs(idx){const wrap=$('vswrap');wrap.innerHTML='';
  const tbl=document.createElement('table');tbl.className='vs';
  const thr=document.createElement('tr');
  const c0=document.createElement('th');c0.textContent='beat \\ lost';thr.appendChild(c0);
- idx.forEach(j=>{const th=document.createElement('th');th.textContent=S.teams[j].name;thr.appendChild(th);});
+ idx.forEach(j=>{const th=document.createElement('th');th.textContent=S.teams[j].name;
+  th.onmouseenter=()=>gHl&&gHl(j);th.onmouseleave=()=>gHlOff&&gHlOff();
+  thr.appendChild(th);});
  const wc=document.createElement('th');wc.className='tot';wc.textContent='W';thr.appendChild(wc);
  const thead=document.createElement('thead');thead.appendChild(thr);tbl.appendChild(thead);
  const tbody=document.createElement('tbody');
  idx.forEach(i=>{const tr=document.createElement('tr');
-  const rh=document.createElement('th');rh.textContent=S.teams[i].name;tr.appendChild(rh);
+  const rh=document.createElement('th');rh.textContent=S.teams[i].name;
+  rh.onmouseenter=()=>gHl&&gHl(i);rh.onmouseleave=()=>gHlOff&&gHlOff();
+  tr.appendChild(rh);
   let w=0;
   idx.forEach(j=>{
    if(i===j){tr.appendChild(vcell('diag','·'));}
@@ -2037,7 +2044,7 @@ function renderVs(idx){const wrap=$('vswrap');wrap.innerHTML='';
 function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
  svg.textContent='';
  if(!S||!idx.length)return;
- const n=idx.length,W=360,cx=W/2,cy=W/2,R=n>1?128:0,NR=5;
+ const n=idx.length,cx=280,cy=200,R=n>1?128:0,NR=5;
  const pos={};
  idx.forEach((ti,k)=>{const a=-Math.PI/2+2*Math.PI*k/n;
   pos[ti]=[cx+R*Math.cos(a),cy+R*Math.sin(a),a];});
@@ -2058,6 +2065,7 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
   t.textContent=S.teams[w].name+' beat '+S.teams[l].name
    +(m.games.length?' ('+fmtGames(m,w===m.a)+')':'');
   g.appendChild(t);svg.appendChild(g);edges.push(g);});
+ const nodes={};
  idx.forEach(ti=>{const p=pos[ti],full=S.teams[ti].name;
   const g=el('g',{'class':'gn'+(ti===selTeam?' sel':'')});
   g.appendChild(el('circle',{'class':'hit',cx:p[0],cy:p[1],r:14}));
@@ -2066,14 +2074,20 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
         lx=cx+(R+13)*c,ly=cy+(R+13)*s;
   const txt=el('text',{x:lx,y:ly+(s>.5?9:s<-.5?-4:3),
    'text-anchor':c>.25?'start':c<-.25?'end':'middle'});
-  txt.textContent=full.length>12?full.slice(0,11)+'…':full;
+  txt.textContent=full;
   const t=document.createElementNS(NS,'title');t.textContent=full;
   g.appendChild(t);g.appendChild(txt);
-  g.onmouseenter=()=>edges.forEach(e=>{e.setAttribute('class',
-   +e.dataset.w===ti?'ge w':+e.dataset.l===ti?'ge l':'ge dim');});
-  g.onmouseleave=()=>edges.forEach(e=>e.setAttribute('class','ge'));
+  g.onmouseenter=()=>gHl(ti);
+  g.onmouseleave=()=>gHlOff();
   g.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
-  svg.appendChild(g);});}
+  svg.appendChild(g);nodes[ti]=g;});
+ gHl=ti=>{edges.forEach(e=>{e.setAttribute('class',
+   +e.dataset.w===ti?'ge w':+e.dataset.l===ti?'ge l':'ge dim');});
+  for(const k in nodes)nodes[k].setAttribute('class',
+   'gn'+(+k===selTeam?' sel':'')+(+k===ti?' hl':''));};
+ gHlOff=()=>{edges.forEach(e=>e.setAttribute('class','ge'));
+  for(const k in nodes)nodes[k].setAttribute('class',
+   'gn'+(+k===selTeam?' sel':''));};}
 function renderTable(){if(!S)return;
  const tb=$('tb'),dl=$('tlist');tb.innerHTML='';dl.innerHTML='';
  const idx=S.teams.map((t,i)=>i).sort((x,y)=>S.teams[y][alg]-S.teams[x][alg]

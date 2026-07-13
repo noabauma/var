@@ -1833,6 +1833,7 @@ main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10p
 #cam{width:100%;display:block;border-radius:10px;background:#000;aspect-ratio:16/9;object-fit:contain}
 #badge{position:absolute;top:12px;left:12px;background:#c0231d;color:#fff;font-weight:700;padding:4px 12px;border-radius:6px;letter-spacing:1px;font-size:13px;animation:p 1s infinite}
 #privacy{position:absolute;inset:0;background:#0b0e12;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:26px;font-weight:700;color:#8b96a5}
+#privacy[hidden]{display:none}
 #privacy span{font-size:14px;font-weight:400;color:#5c6672}
 #camtoggle.off{background:#5c1f1c;color:#fbb}
 #fs{position:absolute;top:12px;right:12px;display:flex;align-items:center;background:rgba(11,14,18,.55);border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:8px;line-height:0;opacity:.65}

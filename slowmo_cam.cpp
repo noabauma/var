@@ -1857,8 +1857,8 @@ button:disabled{opacity:.4;cursor:default}
 .rn input{font:inherit;background:#0b0e12;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:7px 10px;flex:1;min-width:8em}
 .danger{background:#5c1f1c;color:#fbb}
 #tf{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
-#tf input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;flex:1;min-width:8em}
-#tf button{padding:9px 14px}
+#tf input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 10px;flex:1 1 5em;min-width:4.5em}
+#tf button{padding:9px 14px;flex:none;white-space:nowrap}
 #board h3{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:20px 0 6px}
 #h2hwide{width:calc(100vw - 28px);max-width:1600px;position:relative;left:50%;transform:translateX(-50%)}
 #h2h{display:flex;gap:24px;align-items:center;justify-content:center;flex-wrap:wrap}

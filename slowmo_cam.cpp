@@ -361,6 +361,19 @@ struct Shared {
     MessageQueue msgs;
     ScoreBoard *scores = nullptr; // web scoreboard (null = disabled)
     BetBoard *bets = nullptr;     // virtual betting (null = disabled)
+
+    // live-match state, published by the CV referee (referee/referee.py)
+    // and shown as a banner on the page
+    std::mutex match_m;
+    std::string match_json = "{\"on\":false}";
+    void set_match(const std::string &j) {
+        std::lock_guard<std::mutex> lk(match_m);
+        match_json = j;
+    }
+    std::string get_match() {
+        std::lock_guard<std::mutex> lk(match_m);
+        return match_json;
+    }
     std::atomic<bool> alive{true};
     std::atomic<bool> cam_ok{false};      // camera currently streaming
     std::atomic<bool> cam_enabled{true};  // web privacy switch (OFF = no capture)
@@ -2193,6 +2206,9 @@ main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10p
 #badge{position:absolute;top:12px;left:12px;background:#c0231d;color:#fff;font-weight:700;padding:4px 12px;border-radius:6px;letter-spacing:1px;font-size:13px;animation:p 1s infinite}
 #privacy{position:absolute;inset:0;background:#0b0e12;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:26px;font-weight:700;color:#8b96a5}
 #privacy[hidden]{display:none}
+#livematch{position:absolute;left:50%;transform:translateX(-50%);bottom:12px;background:rgba(11,14,18,.82);border:1px solid #1c2530;border-radius:10px;padding:8px 18px;font-size:16px;font-weight:700;color:#fff;white-space:nowrap}
+#livematch small{font-weight:400;color:#8b96a5;margin-left:10px}
+#livematch[hidden]{display:none}
 #privacy span{font-size:14px;font-weight:400;color:#5c6672}
 #camtoggle.off{background:#5c1f1c;color:#fbb}
 #fs{position:absolute;top:12px;right:12px;display:flex;align-items:center;background:rgba(11,14,18,.55);border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:8px;line-height:0;opacity:.65}
@@ -2313,7 +2329,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 </aside>
-<div id="wrap"><img id="cam" src="/stream" alt="live"><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
+<div id="wrap"><img id="cam" src="/stream" alt="live"><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="livematch" hidden></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
 </main>
 <footer>
 <button id="save">&#128308; Save + replay</button>
@@ -2761,6 +2777,14 @@ function renderBets(){if(!BB)return;
 async function bets(){try{const r=await(await fetch('/bets')).json();
  if(r.ok){BB=r;renderBets();}}catch(e){}}
 bets();setInterval(bets,5000);
+async function livematch(){try{const m=await(await fetch('/match')).json();
+ const el=$('livematch');
+ if(!m.on){el.hidden=true;return;}
+ el.textContent=m.a+'  '+m.sa+' : '+m.sb+'  '+m.b;
+ const sm=document.createElement('small');
+ sm.textContent='games '+m.ga+'–'+m.gb+(m.note?' · '+m.note:'');
+ el.appendChild(sm);el.hidden=false;}catch(e){}}
+livematch();setInterval(livematch,2000);
 </script>
 )HTML";
 
@@ -3261,6 +3285,53 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             send_simple(fd, sh, "200 OK", "application/json",
                         on ? "{\"ok\":true,\"cam_on\":true}"
                            : "{\"ok\":true,\"cam_on\":false}");
+        }
+        else if (method == "GET" && route == "/frame") {
+            // one still frame for the CV referee (and anyone else)
+            Frame f = sh->ring.latest();
+            if (!f) {
+                send_simple(fd, sh, "503 Service Unavailable", "text/plain",
+                            "no frame (camera off?)\n");
+            } else {
+                char h[128];
+                int n = std::snprintf(h, sizeof h,
+                                      "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n"
+                                      "Content-Length: %zu\r\nCache-Control: no-store\r\n"
+                                      "Connection: close\r\n\r\n", f->size());
+                if (send_all(fd, h, (size_t)n, sh))
+                    send_all(fd, f->data(), f->size(), sh);
+            }
+        }
+        else if (method == "GET" && route == "/match")
+            send_simple(fd, sh, "200 OK", "application/json", sh->get_match());
+        else if (method == "POST" && route == "/match/state") {
+            // published by referee.py; sanitized and rebuilt server-side
+            bool on = query_str(path, "on") == "1";
+            std::string a = ScoreBoard::sanitize_name(query_str(path, "a"));
+            std::string b = ScoreBoard::sanitize_name(query_str(path, "b"));
+            std::string note = ScoreBoard::sanitize_name(query_str(path, "note"));
+            int sa = atoi(query_str(path, "sa").c_str());
+            int sb = atoi(query_str(path, "sb").c_str());
+            int ga = atoi(query_str(path, "ga").c_str());
+            int gb = atoi(query_str(path, "gb").c_str());
+            auto clamp = [](int v) { return v < 0 ? 0 : (v > 99 ? 99 : v); };
+            std::string j = std::string("{\"on\":") + (on ? "true" : "false");
+            if (on) {
+                j += ",\"a\":\"";
+                json_escape(j, a);
+                j += "\",\"b\":\"";
+                json_escape(j, b);
+                char buf[96];
+                std::snprintf(buf, sizeof buf,
+                              "\",\"sa\":%d,\"sb\":%d,\"ga\":%d,\"gb\":%d,\"note\":\"",
+                              clamp(sa), clamp(sb), clamp(ga), clamp(gb));
+                j += buf;
+                json_escape(j, note);
+                j += "\"";
+            }
+            j += "}";
+            sh->set_match(j);
+            send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
         }
         else if (method == "GET" && route == "/status")
             handle_status(fd, cfg, sh);

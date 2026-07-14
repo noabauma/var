@@ -2,3 +2,7 @@ slowmo_cam
 slowmo_cam_tracr
 __pycache__/
 tracr/
+
+referee/cards/
+referee/calibration*.jpg
+referee/referee.json

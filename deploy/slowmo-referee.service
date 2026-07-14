@@ -1,0 +1,17 @@
+[Unit]
+Description=slowmo-cam CV referee (auto score reading — beta)
+Documentation=file:///home/noabauma/src/var/README.md
+After=slowmo-cam.service
+Wants=slowmo-cam.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=noabauma
+WorkingDirectory=/home/noabauma/src/var/referee
+ExecStart=/usr/bin/python3 /home/noabauma/src/var/referee/referee.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

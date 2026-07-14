@@ -1275,6 +1275,9 @@ struct ScoreBoard {
     std::vector<Match> matches;
     std::vector<double> cache_bias, cache_plain; // per-team; empty = stale
     std::string cache_err;
+    uint64_t mutations = 0;                  // bumped on every accepted change
+    uint64_t hist_stamp = (uint64_t)-1;      // mutations value hist was built at
+    std::vector<std::vector<double>> hist;   // bias scores after match 1..k
     double damping = 0.85; // PageRank d, set from the web slider; not
                            // persisted — a restart returns to the default
 
@@ -1420,6 +1423,34 @@ struct ScoreBoard {
             unlink(tmp.c_str());
             return false;
         }
+        // keep a timestamped copy of every accepted state, so any mishap
+        // can be undone by copying a snapshot back over tournament.tsv
+        size_t slash = file.rfind('/');
+        std::string dir = (slash == std::string::npos ? std::string(".")
+                                                      : file.substr(0, slash)) +
+                          "/tournament_history";
+        if (mkdirs(dir)) {
+            char stamp[32];
+            time_t t = time(nullptr);
+            struct tm tmv;
+            localtime_r(&t, &tmv);
+            strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", &tmv);
+            std::string snap = dir + "/" + stamp + ".tsv";
+            for (int i = 2; access(snap.c_str(), F_OK) == 0 && i < 1000; i++)
+                snap = dir + "/" + std::string(stamp) + "_" + std::to_string(i) +
+                       ".tsv";
+            FILE *src = std::fopen(file.c_str(), "rb");
+            FILE *dst = std::fopen(snap.c_str(), "wb");
+            if (src && dst) {
+                char buf[4096];
+                size_t r;
+                while ((r = std::fread(buf, 1, sizeof buf, src)) > 0)
+                    std::fwrite(buf, 1, r, dst);
+            }
+            if (src) std::fclose(src);
+            if (dst) std::fclose(dst);
+        }
+        mutations++;
         return true;
     }
 
@@ -1688,8 +1719,73 @@ struct ScoreBoard {
             damping = v;
             cache_bias.clear();
             cache_plain.clear();
+            mutations++; // rank history depends on d as well
         }
         return true;
+    }
+
+    // Bias scores after each of the first k matches (k = 1..N, in the order
+    // they are stored in the TSV) — one python session computes all prefixes.
+    std::string history_json() {
+        std::lock_guard<std::mutex> lk(m);
+        const size_t n = teams.size();
+        const size_t S = matches.size();
+        if (n == 0 || S == 0) return "{\"ok\":true,\"teams\":[],\"steps\":[]}";
+        if (hist_stamp != mutations) {
+            std::string in = "H " + std::to_string(S) + " " + std::to_string(n);
+            std::vector<double> M(n * n, 0.0);
+            char num[32];
+            for (size_t k = 0; k < S; k++) {
+                const Match &mt = matches[k];
+                int l = mt.winner == mt.a ? mt.b : mt.a;
+                M[(size_t)mt.winner * n + l] += 1.0;
+                for (size_t i = 0; i < n * n; i++) {
+                    std::snprintf(num, sizeof num, " %g", M[i]);
+                    in += num;
+                }
+            }
+            in += "\n";
+            char darg[16];
+            std::snprintf(darg, sizeof darg, "%.4f", damping);
+            std::string out, err;
+            if (!run_script(script, darg, in, out, err, 60000)) {
+                std::string j = "{\"ok\":false,\"error\":\"";
+                json_escape(j, err);
+                return j + "\"}";
+            }
+            hist.assign(S, std::vector<double>(n, 0.0));
+            const char *p = out.c_str();
+            char *end;
+            for (size_t k = 0; k < S; k++)
+                for (size_t i = 0; i < n; i++) {
+                    double v = strtod(p, &end);
+                    if (end == p)
+                        return "{\"ok\":false,\"error\":\"unexpected history output\"}";
+                    hist[k][i] = v;
+                    p = end;
+                }
+            hist_stamp = mutations;
+        }
+        std::string j = "{\"ok\":true,\"teams\":[";
+        for (size_t i = 0; i < n; i++) {
+            if (i) j += ',';
+            j += '"';
+            json_escape(j, teams[i]);
+            j += '"';
+        }
+        j += "],\"steps\":[";
+        char buf[32];
+        for (size_t k = 0; k < hist.size(); k++) {
+            if (k) j += ',';
+            j += '[';
+            for (size_t i = 0; i < n && i < hist[k].size(); i++) {
+                if (i) j += ',';
+                std::snprintf(buf, sizeof buf, "%.6f", hist[k][i]);
+                j += buf;
+            }
+            j += ']';
+        }
+        return j + "]}";
     }
 
     bool add_team(const std::string &raw, const std::string &p1,
@@ -1884,6 +1980,21 @@ button:disabled{opacity:.4;cursor:default}
 #gwrap{flex:0 1 520px;min-width:320px;max-width:560px}
 #gwrap svg{width:100%;height:auto;display:block;overflow:visible}
 #gcap{color:#5c6672;font-size:12px;margin-top:4px}
+#rhblock{margin-top:20px}
+#rhblock h3{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:0 0 6px}
+#rhwrap{overflow-x:auto}
+#rhsvg{width:100%;height:auto;display:block}
+.rh-grid{stroke:#151c25;stroke-width:1}
+.rh-rank,.rh-x{fill:#5c6672;font:11px system-ui,sans-serif}
+.rh-lbl{fill:#aeb9c7;font:11px system-ui,sans-serif}
+.rh-line{fill:none;stroke:#3b4652;stroke-width:2;stroke-linejoin:round}
+.rh-dot{fill:#3b4652}
+.rh-hit{fill:none;stroke:transparent;stroke-width:12}
+.rh-t{cursor:pointer}
+#rhsvg.dimall .rh-t:not(.hl){opacity:.22}
+.rh-t.hl .rh-line,.rh-t.sel .rh-line{stroke:#3b82f6;stroke-width:3}
+.rh-t.hl .rh-dot,.rh-t.sel .rh-dot{fill:#3b82f6}
+.rh-t.hl .rh-lbl,.rh-t.sel .rh-lbl{fill:#fff;font-weight:700}
 #gcap .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 4px 0 10px}
 #gcap .sw:first-child{margin-left:0}
 .ge line{stroke:#5c6672;stroke-width:2}
@@ -1968,6 +2079,11 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <svg id="gsvg" viewBox="0 0 560 400" role="img" aria-label="who beat whom, as a graph"></svg>
 <div id="gcap"><span class="sw" style="background:#81c784"></span>wins <span class="sw" style="background:#e57373"></span>losses of the hovered team · arrow points at the loser · click selects</div>
 </div>
+</div>
+<div id="rhblock" hidden>
+<h3>Rank history</h3>
+<div id="rhwrap"><svg id="rhsvg" role="img" aria-label="rank of each team after every entered match"></svg></div>
+<div id="gcap">rank after each match, in entry order &middot; hover a line to follow one team &middot; click selects</div>
 </div>
 </div>
 </section>
@@ -2235,10 +2351,52 @@ function renderTable(){if(!S)return;
   const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
  $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';
  renderVs(idx);renderGraph(idx);}
+let HIST=null;
+async function rankhist(){try{const h=await(await fetch('/scores/history')).json();
+ if(h.ok){HIST=h;drawRankHist();}}catch(e){}}
+function drawRankHist(){const svg=$('rhsvg');if(!svg||!HIST)return;
+ svg.textContent='';
+ const T=HIST.teams,steps=HIST.steps,S2=steps.length,n=T.length;
+ if(!S2||n<2){$('rhblock').hidden=true;return;}
+ $('rhblock').hidden=false;
+ const ranks=steps.map(sc=>{const idx=T.map((t,i)=>i)
+   .sort((x,y)=>sc[y]-sc[x]||T[x].localeCompare(T[y]));
+  const r=new Array(n);idx.forEach((ti,k)=>r[ti]=k+1);return r;});
+ const ML=34,MR=160,MT=10,MB=26,W=860,H=n*26+MT+MB;
+ svg.setAttribute('viewBox','0 0 '+W+' '+H);
+ const iw=W-ML-MR;
+ const X=k=>ML+(S2<2?iw/2:k*iw/(S2-1));
+ const Y=r=>MT+(r-1)*26+13;
+ const NS='http://www.w3.org/2000/svg';
+ const el=(t,a)=>{const e=document.createElementNS(NS,t);
+  for(const k in a)e.setAttribute(k,a[k]);return e;};
+ for(let r=1;r<=n;r++){
+  svg.appendChild(el('line',{x1:ML,y1:Y(r),x2:W-MR,y2:Y(r),'class':'rh-grid'}));
+  const t=el('text',{x:ML-6,y:Y(r)+4,'text-anchor':'end','class':'rh-rank'});
+  t.textContent=r;svg.appendChild(t);}
+ const stepEvery=Math.max(1,Math.ceil(S2/14));
+ for(let k=0;k<S2;k+=stepEvery){
+  const t=el('text',{x:X(k),y:H-8,'text-anchor':'middle','class':'rh-x'});
+  t.textContent=k+1;svg.appendChild(t);}
+ T.forEach((nm,ti)=>{
+  const pts=ranks.map((r,k)=>X(k)+','+Y(r[ti])).join(' ');
+  const g=el('g',{'class':'rh-t'+(ti===selTeam?' sel':'')});
+  g.appendChild(el('polyline',{points:pts,'class':'rh-hit'}));
+  g.appendChild(el('polyline',{points:pts,'class':'rh-line'}));
+  ranks.forEach((r,k)=>g.appendChild(el('circle',{cx:X(k),cy:Y(r[ti]),r:3,'class':'rh-dot'})));
+  const lb=el('text',{x:W-MR+8,y:Y(ranks[S2-1][ti])+4,'class':'rh-lbl'});
+  lb.textContent=nm;g.appendChild(lb);
+  const ttl=document.createElementNS(NS,'title');
+  ttl.textContent=nm+' — rank '+ranks[S2-1][ti]+' after match '+S2;
+  g.appendChild(ttl);
+  g.onmouseenter=()=>{svg.classList.add('dimall');g.classList.add('hl');};
+  g.onmouseleave=()=>{svg.classList.remove('dimall');g.classList.remove('hl');};
+  g.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
+  svg.appendChild(g);});}
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
- renderTable();renderDetail();}catch(e){}}
+ renderTable();renderDetail();rankhist();}catch(e){}}
 $('algb').onclick=()=>{alg='bias';renderTable();};
 $('algp').onclick=()=>{alg='plain';renderTable();};
 $('af').addEventListener('submit',async e=>{e.preventDefault();
@@ -2757,6 +2915,9 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_status(fd, cfg, sh);
         else if (method == "GET" && route == "/scores")
             handle_scores(fd, sh);
+        else if (method == "GET" && route == "/scores/history" && sh->scores)
+            send_simple(fd, sh, "200 OK", "application/json",
+                        sh->scores->history_json());
         else if (method == "POST" && route == "/scores/add")
             handle_scores_add(fd, sh, path);
         else if (method == "POST" && route == "/scores/rename")

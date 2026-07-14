@@ -36,6 +36,22 @@ def main():
         if not 0.0 <= d <= 0.99:
             sys.exit("damping factor must be in [0, 0.99]")
     data = sys.stdin.read().split()
+    if data and data[0] == "H":
+        # history mode: S prefix-matrices over the same n teams; prints S
+        # lines of bias scores (one per snapshot) in one numpy session
+        S, n = int(data[1]), int(data[2])
+        vals = [float(x) for x in data[3:3 + S * n * n]]
+        if len(vals) != S * n * n:
+            sys.exit("history data incomplete")
+        lines = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for k in range(S):
+                M = np.array(vals[k * n * n:(k + 1) * n * n],
+                             dtype=np.float64).reshape(n, n)
+                v = pagerank_bias(M, d, participation_bias=True)
+                lines.append(" ".join(f"{x:.10f}" for x in v))
+        print("\n".join(lines))
+        return
     n = int(data[0])
     if n <= 0:
         print()

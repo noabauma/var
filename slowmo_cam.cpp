@@ -2327,12 +2327,6 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <option value="5">5 fps</option>
 </select>
 </footer>
-<section id="betsec">
-<h2>Virtual betting &middot; no money, just glory</h2>
-<div id="bctl"></div>
-<div id="berr"></div>
-<div id="bboard"></div>
-</section>
 <section id="board">
 <h2>Manage tournament</h2>
 <div id="detail" hidden></div>
@@ -2395,6 +2389,12 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <li>After each goal, the team that conceded serves next and may place the ball (yellow or white) on their 5-bar or in the serve hole.</li>
 </ul></aside>
 </div>
+<section id="betsec">
+<h2>Virtual betting &middot; no money, just glory &middot; beta</h2>
+<div id="bctl"></div>
+<div id="berr"></div>
+<div id="bboard"></div>
+</section>
 <div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>f</kbd> fullscreen&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live
 &nbsp;&middot;&nbsp; source: <a href="https://github.com/noabauma/var" target="_blank" rel="noopener">github.com/noabauma/var</a></div>
 <script>

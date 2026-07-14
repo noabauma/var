@@ -1917,6 +1917,7 @@ table.vs thead th:hover,table.vs tbody th:hover{color:#fff}
 #board table.vs tbody tr:hover td{background:none}
 kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 #help{text-align:center;color:#5c6672;font-size:12px;padding-bottom:12px}
+#help a{color:#8b96a5}
 </style>
 <header><h1>slowmo-cam</h1><span id="st">connecting&hellip;</span></header>
 <main>
@@ -2004,7 +2005,8 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <li>After each goal, the team that conceded serves next and may place the ball (yellow or white) on their 5-bar or in the serve hole.</li>
 </ul></aside>
 </div>
-<div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>f</kbd> fullscreen&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live</div>
+<div id="help"><kbd>space</kbd> save&nbsp; <kbd>r</kbd> replay&nbsp; <kbd>f</kbd> fullscreen&nbsp; <kbd>l</kbd>/<kbd>esc</kbd>/click live
+&nbsp;&middot;&nbsp; source: <a href="https://github.com/noabauma/var" target="_blank" rel="noopener">github.com/noabauma/var</a></div>
 <script>
 const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');
 let timer=0,replayFrames=0,playFps=30,slow=4,recs=[],playingRec=null;

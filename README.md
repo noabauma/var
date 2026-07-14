@@ -53,6 +53,15 @@ On the page: live view, status bar (fps / buffer / drops / 👁 viewer count),
 **recordings panel** (click to replay a clip, ✎ rename = keep forever,
 🗑 delete). Keys: `space` save, `r` replay, `f` fullscreen, `l`/`esc` live.
 
+**🎲 Virtual betting (no money, just glory):** spectators and players sign
+in with just a name, someone opens betting on the match about to start,
+and everyone picks a team at odds derived from the bias PageRank standings
+(locked at bet time; underdogs pay more). Bets settle automatically when
+the result is entered — a win pays `odds×10` points — and a bettor
+leaderboard tracks points and records in `<out-dir>/bets.tsv`.
+Endpoints: `GET /bets`, `POST /bets/open?a=X&b=Y`,
+`POST /bets/place?who=N&pick=X`, `POST /bets/cancel`.
+
 **📷 Camera ON/OFF (privacy switch):** anyone can pause recording from the
 page. OFF truly stops capture — the V4L2 device is closed, the ring buffer
 is wiped (nothing from before the press can be saved), `/save` is refused,

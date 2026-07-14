@@ -354,11 +354,13 @@ private:
 };
 
 struct ScoreBoard; // tournament rankings, defined after the capture threads
+struct BetBoard;   // virtual betting, defined after ScoreBoard
 
 struct Shared {
     Ring ring;
     MessageQueue msgs;
     ScoreBoard *scores = nullptr; // web scoreboard (null = disabled)
+    BetBoard *bets = nullptr;     // virtual betting (null = disabled)
     std::atomic<bool> alive{true};
     std::atomic<bool> cam_ok{false};      // camera currently streaming
     std::atomic<bool> cam_enabled{true};  // web privacy switch (OFF = no capture)
@@ -1635,8 +1637,12 @@ struct ScoreBoard {
         return j + "]}";
     }
 
+    // o_a/o_b/o_w (optional) receive the sanitized team names and the winner
+    // — the bet board settles on them after a successful entry
     bool add_match(const std::string &a_raw, const std::string &b_raw,
-                   const std::string &games_raw, std::string &err) {
+                   const std::string &games_raw, std::string &err,
+                   std::string *o_a = nullptr, std::string *o_b = nullptr,
+                   std::string *o_w = nullptr) {
         std::string an = sanitize_name(a_raw), bn = sanitize_name(b_raw);
         if (an.empty() || bn.empty()) { err = "both team names are required"; return false; }
         if (an == bn) { err = "a team cannot play itself"; return false; }
@@ -1670,9 +1676,46 @@ struct ScoreBoard {
             return false;
         }
         matches.push_back({ai, bi, gs, wa > wb ? ai : bi}); // hi==2 => no tie
+        if (o_a) *o_a = an;
+        if (o_b) *o_b = bn;
+        if (o_w) *o_w = wa > wb ? an : bn;
         cache_bias.clear();
         cache_plain.clear();
         return save_locked(err);
+    }
+
+    // bias PageRank score of one team by name (recomputes if stale);
+    // used to derive betting odds
+    bool bias_of(const std::string &name, double &out) {
+        std::lock_guard<std::mutex> lk(m);
+        if (cache_bias.size() != teams.size()) recompute_locked();
+        if (!cache_err.empty() || cache_bias.size() != teams.size()) return false;
+        for (size_t i = 0; i < teams.size(); i++)
+            if (teams[i] == name) { out = cache_bias[i]; return true; }
+        return false;
+    }
+
+    // a pair is bettable if both teams exist and they have not played yet
+    bool can_bet_pair(const std::string &a_raw, const std::string &b_raw,
+                      std::string &err) {
+        std::string an = sanitize_name(a_raw), bn = sanitize_name(b_raw);
+        if (an.empty() || bn.empty() || an == bn) {
+            err = "pick two different teams";
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(m);
+        int ai = -1, bi = -1;
+        for (size_t i = 0; i < teams.size(); i++) {
+            if (teams[i] == an) ai = (int)i;
+            if (teams[i] == bn) bi = (int)i;
+        }
+        if (ai < 0) { err = "no team named \"" + an + "\""; return false; }
+        if (bi < 0) { err = "no team named \"" + bn + "\""; return false; }
+        if (find_match_locked(ai, bi) >= 0) {
+            err = an + " vs " + bn + " has already been played";
+            return false;
+        }
+        return true;
     }
 
     bool rename_team(const std::string &old_raw, const std::string &new_raw,
@@ -1892,6 +1935,226 @@ struct ScoreBoard {
     }
 };
 
+// ------------------------------------------------------------ virtual bets
+// Pure-virtual betting for spectators (and brave players): anyone opens
+// betting on the match about to be played, picks a team at odds derived
+// from the bias PageRank standings (locked at bet time), and the bet
+// settles automatically when the result is entered on the scoreboard.
+// No money — points and bragging rights only. Identity is a typed name,
+// trust-based like the rest of the tournament.
+
+struct BetBoard {
+    struct Bet {
+        std::string who, a, b, pick;
+        int odds_x100 = 100; // decimal odds at placement, x100
+        bool settled = false, won = false;
+    };
+
+    std::mutex m;
+    std::string file;           // TSV persistence (<out_dir>/bets.tsv)
+    std::string open_a, open_b; // betting window (team names); empty = none
+    std::vector<Bet> bets;
+
+    static int win_points(int odds_x100) { return (odds_x100 + 5) / 10; }
+
+    bool save_locked(std::string &err) {
+        std::string tmp = file + ".tmp";
+        FILE *fh = std::fopen(tmp.c_str(), "w");
+        if (!fh) { err = errno_str("open " + tmp); return false; }
+        bool ok = true;
+        if (!open_a.empty())
+            ok = ok && std::fprintf(fh, "open\t%s\t%s\n", open_a.c_str(),
+                                    open_b.c_str()) > 0;
+        for (const auto &b : bets)
+            ok = ok && std::fprintf(fh, "bet\t%s\t%s\t%s\t%s\t%d\t%d\t%d\n",
+                                    b.who.c_str(), b.a.c_str(), b.b.c_str(),
+                                    b.pick.c_str(), b.odds_x100,
+                                    b.settled ? 1 : 0, b.won ? 1 : 0) > 0;
+        ok = std::fflush(fh) == 0 && ok && !ferror(fh);
+        std::fclose(fh);
+        if (!ok || rename(tmp.c_str(), file.c_str()) != 0) {
+            err = errno_str("write " + file);
+            unlink(tmp.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    void load() {
+        std::lock_guard<std::mutex> lk(m);
+        FILE *fh = std::fopen(file.c_str(), "r");
+        if (!fh) return;
+        char line[512];
+        while (std::fgets(line, sizeof line, fh)) {
+            std::string s(line);
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+                s.pop_back();
+            std::vector<std::string> f;
+            size_t pos = 0;
+            while (true) {
+                size_t tab = s.find('\t', pos);
+                f.push_back(s.substr(pos, tab == std::string::npos ? tab
+                                                                   : tab - pos));
+                if (tab == std::string::npos) break;
+                pos = tab + 1;
+            }
+            if (f[0] == "open" && f.size() == 3) {
+                open_a = f[1];
+                open_b = f[2];
+            } else if (f[0] == "bet" && f.size() == 8) {
+                Bet b;
+                b.who = f[1]; b.a = f[2]; b.b = f[3]; b.pick = f[4];
+                b.odds_x100 = atoi(f[5].c_str());
+                b.settled = f[6] == "1";
+                b.won = f[7] == "1";
+                if (!b.who.empty() && b.odds_x100 >= 100) bets.push_back(b);
+            }
+        }
+        std::fclose(fh);
+    }
+
+    bool open_match(const std::string &a, const std::string &b,
+                    std::string &err) {
+        std::lock_guard<std::mutex> lk(m);
+        if (!open_a.empty()) {
+            err = "betting is already open for " + open_a + " vs " + open_b +
+                  " — settle or cancel it first";
+            return false;
+        }
+        open_a = a;
+        open_b = b;
+        return save_locked(err);
+    }
+
+    // voids the open window and removes its unsettled bets
+    bool cancel(std::string &err) {
+        std::lock_guard<std::mutex> lk(m);
+        if (open_a.empty()) { err = "no open betting to cancel"; return false; }
+        bets.erase(std::remove_if(bets.begin(), bets.end(),
+                                  [&](const Bet &b) {
+                                      return !b.settled &&
+                                             ((b.a == open_a && b.b == open_b) ||
+                                              (b.a == open_b && b.b == open_a));
+                                  }),
+                   bets.end());
+        open_a.clear();
+        open_b.clear();
+        return save_locked(err);
+    }
+
+    bool place(const std::string &who_raw, const std::string &pick_raw,
+               double odds, std::string &err) {
+        std::string who = ScoreBoard::sanitize_name(who_raw);
+        std::string pick = ScoreBoard::sanitize_name(pick_raw);
+        if (who.empty()) { err = "enter your name first"; return false; }
+        std::lock_guard<std::mutex> lk(m);
+        if (open_a.empty()) { err = "no match is open for betting"; return false; }
+        if (pick != open_a && pick != open_b) {
+            err = "pick must be " + open_a + " or " + open_b;
+            return false;
+        }
+        int ox = (int)(odds * 100.0 + 0.5);
+        if (ox < 101) ox = 101;
+        if (ox > 2000) ox = 2000;
+        for (auto &b : bets) // re-betting replaces the open bet
+            if (!b.settled && b.who == who &&
+                ((b.a == open_a && b.b == open_b) ||
+                 (b.a == open_b && b.b == open_a))) {
+                b.pick = pick;
+                b.odds_x100 = ox;
+                return save_locked(err);
+            }
+        bets.push_back({who, open_a, open_b, pick, ox, false, false});
+        return save_locked(err);
+    }
+
+    // called after a result was entered on the scoreboard
+    void settle(const std::string &a, const std::string &b,
+                const std::string &winner, MessageQueue &msgs) {
+        std::lock_guard<std::mutex> lk(m);
+        int n = 0;
+        for (auto &bet : bets)
+            if (!bet.settled && ((bet.a == a && bet.b == b) ||
+                                 (bet.a == b && bet.b == a))) {
+                bet.settled = true;
+                bet.won = bet.pick == winner;
+                n++;
+            }
+        if ((open_a == a && open_b == b) || (open_a == b && open_b == a)) {
+            open_a.clear();
+            open_b.clear();
+        }
+        if (n) {
+            std::string err;
+            save_locked(err);
+            msgs.push("bets: settled " + std::to_string(n) + " bet(s) on " +
+                      a + " vs " + b);
+        }
+    }
+
+    std::string json() {
+        std::lock_guard<std::mutex> lk(m);
+        std::string j = "{\"ok\":true,\"open\":";
+        if (open_a.empty()) {
+            j += "null";
+        } else {
+            j += "{\"a\":\"";
+            json_escape(j, open_a);
+            j += "\",\"b\":\"";
+            json_escape(j, open_b);
+            j += "\"}";
+        }
+        j += ",\"bets\":[";
+        bool first = true;
+        for (const auto &b : bets) { // only the open window's bets go out
+            if (b.settled || open_a.empty()) continue;
+            if (!((b.a == open_a && b.b == open_b) ||
+                  (b.a == open_b && b.b == open_a))) continue;
+            if (!first) j += ',';
+            first = false;
+            j += "{\"who\":\"";
+            json_escape(j, b.who);
+            j += "\",\"pick\":\"";
+            json_escape(j, b.pick);
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "\",\"odds\":%.2f}",
+                          b.odds_x100 / 100.0);
+            j += buf;
+        }
+        j += "],\"board\":[";
+        // leaderboard: aggregate settled bets per bettor
+        std::vector<std::string> names;
+        std::vector<int> pts, won, lost;
+        for (const auto &b : bets) {
+            if (!b.settled) continue;
+            size_t k = 0;
+            for (; k < names.size(); k++)
+                if (names[k] == b.who) break;
+            if (k == names.size()) {
+                names.push_back(b.who);
+                pts.push_back(0); won.push_back(0); lost.push_back(0);
+            }
+            if (b.won) { pts[k] += win_points(b.odds_x100); won[k]++; }
+            else lost[k]++;
+        }
+        std::vector<size_t> order(names.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](size_t x, size_t y) { return pts[x] > pts[y]; });
+        for (size_t k = 0; k < order.size(); k++) {
+            size_t i = order[k];
+            if (k) j += ',';
+            j += "{\"who\":\"";
+            json_escape(j, names[i]);
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "\",\"points\":%d,\"won\":%d,\"lost\":%d}",
+                          pts[i], won[i], lost[i]);
+            j += buf;
+        }
+        return j + "]}";
+    }
+};
+
 // -------------------------------------------------------------- web server
 // Live view + remote VAR control. One listener thread accepts connections;
 // each client gets a detached handler thread. Live frames go out as
@@ -1943,7 +2206,20 @@ footer select{font:inherit;font-weight:600;border:0;border-radius:10px;padding:1
 button:disabled{opacity:.4;cursor:default}
 #save{background:#b3261e;color:#fff}
 #board{max-width:720px;margin:0 auto;padding:0 14px 8px;width:100%;box-sizing:border-box}
-#board h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase}
+#board h2,#betsec h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase}
+#betsec{max-width:720px;margin:0 auto;padding:0 14px 8px;width:100%;box-sizing:border-box}
+#betsec table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin-top:6px}
+#betsec th,#betsec td{text-align:left;padding:6px 8px;border-bottom:1px solid #1c2530}
+#betsec th{color:#5c6672;font-size:12px}
+#betsec td:first-child,#betsec th:first-child{width:2em;color:#5c6672}
+#betsec td:nth-child(n+3),#betsec th:nth-child(n+3){text-align:right}
+.betrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
+.betrow input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;flex:1;min-width:8em}
+.betbtn{flex:1;padding:12px;font-size:15px}
+.betbtn b{display:block;font-size:12px;color:#8b96a5;font-weight:400;margin-top:3px}
+.betbtn.my{outline:2px solid #3b82f6}
+.betnow{color:#e5c07b;font-weight:700}
+#berr{color:#e57373;font-size:13px;min-height:1.2em}
 #board table,#scorepane table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 #board th,#board td,#scorepane th,#scorepane td{text-align:left;padding:6px 8px;border-bottom:1px solid #1c2530}
 #board th,#scorepane th{color:#5c6672;font-size:12px}
@@ -2051,6 +2327,12 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <option value="5">5 fps</option>
 </select>
 </footer>
+<section id="betsec">
+<h2>Virtual betting &middot; no money, just glory</h2>
+<div id="bctl"></div>
+<div id="berr"></div>
+<div id="bboard"></div>
+</section>
 <section id="board">
 <h2>Manage tournament</h2>
 <div id="detail" hidden></div>
@@ -2411,6 +2693,74 @@ $('tf').addEventListener('submit',async e=>{e.preventDefault();
   +'&p2='+enc($('tp2').value)+'&res='+enc($('tp3').value)))
   $('tn').value=$('tp1').value=$('tp2').value=$('tp3').value='';});
 scores();setInterval(scores,10000);
+let BB=null,bettor=localStorage.getItem('bettor')||'';
+async function post2(u){try{const r=await(await fetch(u,{method:'POST'})).json();
+ if(!r.ok){$('berr').textContent=r.error;return false;}
+ $('berr').textContent='';return true;}catch(e){return false;}}
+function betOdds(a,b,pick){if(!S)return 2;
+ const f=n=>{const t=S.teams.find(t=>t.name===n);return t?t.bias:0;};
+ const va=f(a),vb=f(b);let p=(va+vb>1e-12)?((pick===a?va:vb)/(va+vb)):0.5;
+ p=Math.min(.99,Math.max(.05,p));return 1/p;}
+function renderBets(){if(!BB)return;
+ const c=$('bctl');c.innerHTML='';
+ const nr=document.createElement('div');nr.className='betrow';
+ const ni=document.createElement('input');ni.placeholder='your name (to bet)';
+ ni.maxLength=40;ni.value=bettor;
+ ni.onchange=()=>{bettor=ni.value.trim();localStorage.setItem('bettor',bettor);renderBets();};
+ nr.appendChild(ni);c.appendChild(nr);
+ if(BB.open){const o=BB.open;
+  const t=document.createElement('div');t.className='betrow betnow';
+  const ts=document.createElement('span');ts.textContent='NOW: '+o.a+' vs '+o.b;
+  ts.style.flex='1';t.appendChild(ts);
+  const cb=document.createElement('button');cb.textContent='✕ cancel';cb.className='mbtn';
+  cb.onclick=async()=>{if(confirm('Cancel betting? Open bets are voided.')&&await post2('/bets/cancel'))bets();};
+  t.appendChild(cb);c.appendChild(t);
+  const my=BB.bets.find(x=>x.who===bettor);
+  const br=document.createElement('div');br.className='betrow';
+  [o.a,o.b].forEach(nm=>{
+   const bt=document.createElement('button');
+   bt.className='betbtn'+(my&&my.pick===nm?' my':'');
+   bt.textContent=nm;
+   const odds=betOdds(o.a,o.b,nm);
+   const sub=document.createElement('b');
+   sub.textContent='odds '+odds.toFixed(2)+'× → +'+Math.round(odds*10)+' pts if they win';
+   bt.appendChild(sub);
+   bt.onclick=async()=>{
+    if(!bettor){$('berr').textContent='enter your name first';return;}
+    if(await post2('/bets/place?who='+enc(bettor)+'&pick='+enc(nm)))bets();};
+   br.appendChild(bt);});
+  c.appendChild(br);
+  const mi=document.createElement('div');mi.className='mrow';
+  mi.textContent=(my?'your bet: '+my.pick+' @ '+my.odds.toFixed(2)+'× · ':'')
+   +BB.bets.length+' bet(s) placed — settle by entering the result under Manage';
+  c.appendChild(mi);
+ }else{
+  const r=document.createElement('div');r.className='betrow';
+  const i1=document.createElement('input');i1.setAttribute('list','tlist');
+  i1.placeholder='team A';i1.maxLength=40;
+  const i2=document.createElement('input');i2.setAttribute('list','tlist');
+  i2.placeholder='team B';i2.maxLength=40;
+  const ob=document.createElement('button');ob.textContent='Open betting';
+  ob.onclick=async()=>{if(await post2('/bets/open?a='+enc(i1.value)+'&b='+enc(i2.value)))bets();};
+  r.appendChild(i1);r.appendChild(i2);r.appendChild(ob);c.appendChild(r);
+  const hint=document.createElement('div');hint.className='mrow';
+  hint.textContent='open betting on the match about to start — everyone picks a team, bets settle automatically with the result';
+  c.appendChild(hint);}
+ const bb=$('bboard');bb.innerHTML='';
+ if(BB.board.length){
+  const tbl=document.createElement('table');
+  const th=document.createElement('thead');
+  th.innerHTML='<tr><th>#</th><th>bettor</th><th>points</th><th>W</th><th>L</th></tr>';
+  tbl.appendChild(th);
+  const tb2=document.createElement('tbody');
+  BB.board.forEach((r,i)=>{const tr=document.createElement('tr');
+   [i+1,r.who,r.points,r.won,r.lost].forEach(v=>{
+    const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});
+   tb2.appendChild(tr);});
+  tbl.appendChild(tb2);bb.appendChild(tbl);}}
+async function bets(){try{const r=await(await fetch('/bets')).json();
+ if(r.ok){BB=r;renderBets();}}catch(e){}}
+bets();setInterval(bets,5000);
 </script>
 )HTML";
 
@@ -2747,12 +3097,13 @@ static void handle_scores_add(int fd, Shared *sh, const std::string &path) {
         scores_error(fd, sh, "503 Service Unavailable", "scoreboard disabled");
         return;
     }
-    std::string err;
+    std::string err, an, bn, wn;
     if (!sh->scores->add_match(query_str(path, "a"), query_str(path, "b"),
-                               query_str(path, "games"), err)) {
+                               query_str(path, "games"), err, &an, &bn, &wn)) {
         scores_error(fd, sh, "400 Bad Request", err);
         return;
     }
+    if (sh->bets) sh->bets->settle(an, bn, wn, sh->msgs);
     send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
 }
 
@@ -2920,6 +3271,41 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
                         sh->scores->history_json());
         else if (method == "POST" && route == "/scores/add")
             handle_scores_add(fd, sh, path);
+        else if (method == "GET" && route == "/bets" && sh->bets)
+            send_simple(fd, sh, "200 OK", "application/json", sh->bets->json());
+        else if (method == "POST" && route == "/bets/open" && sh->bets && sh->scores) {
+            std::string a = query_str(path, "a"), b = query_str(path, "b"), err;
+            bool ok = sh->scores->can_bet_pair(a, b, err) &&
+                      sh->bets->open_match(ScoreBoard::sanitize_name(a),
+                                           ScoreBoard::sanitize_name(b), err);
+            scores_mutation(fd, sh, ok, err);
+        } else if (method == "POST" && route == "/bets/place" && sh->bets && sh->scores) {
+            std::string err;
+            // odds from the current bias standings, locked into the bet
+            double va = 0, vb = 0, p = 0.5;
+            std::string oa, ob;
+            {
+                std::lock_guard<std::mutex> lk(sh->bets->m);
+                oa = sh->bets->open_a;
+                ob = sh->bets->open_b;
+            }
+            if (oa.empty()) {
+                scores_mutation(fd, sh, false, "no match is open for betting");
+            } else {
+                std::string pick = ScoreBoard::sanitize_name(query_str(path, "pick"));
+                sh->scores->bias_of(oa, va);
+                sh->scores->bias_of(ob, vb);
+                if (va + vb > 1e-12)
+                    p = (pick == oa ? va : vb) / (va + vb);
+                if (p < 0.05) p = 0.05;
+                if (p > 0.99) p = 0.99;
+                bool ok = sh->bets->place(query_str(path, "who"), pick, 1.0 / p, err);
+                scores_mutation(fd, sh, ok, err);
+            }
+        } else if (method == "POST" && route == "/bets/cancel" && sh->bets) {
+            std::string err;
+            scores_mutation(fd, sh, sh->bets->cancel(err), err);
+        }
         else if (method == "POST" && route == "/scores/rename")
             handle_scores_rename(fd, sh, path);
         else if (method == "POST" && route == "/scores/undo")
@@ -3245,6 +3631,7 @@ int main(int argc, char **argv) {
                              "replay will not (sudo apt install ffmpeg)\n");
 
     ScoreBoard scores; // declared before sh: outlives the web client threads
+    BetBoard bets;
     Shared sh(cfg.max_frames(), (size_t)cfg.capture_fps);
     if (!cfg.no_scores && cfg.http_port > 0 && cfg.selftest == 0) {
         if (access(cfg.scores_script.c_str(), F_OK) != 0) {
@@ -3256,6 +3643,9 @@ int main(int argc, char **argv) {
             scores.file = cfg.scores_file;
             scores.load_or_seed(sh.msgs);
             sh.scores = &scores;
+            bets.file = cfg.out_dir + "/bets.tsv";
+            bets.load();
+            sh.bets = &bets;
         }
     }
     std::thread cap(cfg.mjpeg_file.empty() ? v4l2_capture_thread

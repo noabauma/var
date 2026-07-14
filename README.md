@@ -78,7 +78,8 @@ Rankings switchable between **bias PageRank**
 **classic PageRank** (`page_rank_biliardino_algorithm.py`). The Python files
 are the single source of truth — edit them and the board follows
 (`recursive_deletion` is deliberately not applied mid-tournament). The
-damping slider (default 0.85) is the only thing not persisted.
+damping factor defaults to 0.85 and is settable via the API only
+(`POST /scores/d`, not persisted).
 
 One big group; a match is **best of three** to 10; **each pair plays at most
 once**. Enter *team A*, *team B*, game scores from A's view

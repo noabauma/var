@@ -1860,9 +1860,6 @@ button:disabled{opacity:.4;cursor:default}
 #algsw{display:flex;gap:8px;margin-bottom:10px}
 #algsw button{flex:1;padding:7px 8px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
 #algsw button.on{background:#1c2530;border-color:#3b82f6;color:#fff}
-#dctl{display:flex;gap:10px;align-items:center;margin-bottom:10px;font-size:13px;color:#8b96a5}
-#dctl input{flex:1;max-width:240px;margin:0;accent-color:#3b82f6}
-#dctl b{color:#dfe6ee;font-variant-numeric:tabular-nums;min-width:2.6em}
 #scorepane tbody tr{cursor:pointer}
 #scorepane tbody tr:hover td,#scorepane tr.sel td{background:#141a21}
 #detail{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:12px;margin-top:10px;font-size:14px}
@@ -1926,11 +1923,6 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <div id="algsw">
 <button id="algb" class="on">Bias PageRank</button>
 <button id="algp">Classic PageRank</button>
-</div>
-<div id="dctl" title="PageRank damping: how much of the score comes from match results (d) vs. the baseline (1−d)">
-<span>damping d</span>
-<input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">
-<b id="dval">0.85</b>
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 </aside>
@@ -2246,14 +2238,9 @@ function renderTable(){if(!S)return;
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
- if(typeof s.d==='number'&&document.activeElement!==dsl)
-  {dsl.value=s.d;dval.textContent=s.d.toFixed(2);}
  renderTable();renderDetail();}catch(e){}}
 $('algb').onclick=()=>{alg='bias';renderTable();};
 $('algp').onclick=()=>{alg='plain';renderTable();};
-const dsl=$('dsl'),dval=$('dval');
-dsl.oninput=()=>dval.textContent=(+dsl.value).toFixed(2);
-dsl.onchange=()=>post('/scores/d?value='+dsl.value);
 $('af').addEventListener('submit',async e=>{e.preventDefault();
  try{const r=await(await fetch('/scores/add?a='+encodeURIComponent($('ta').value)
   +'&b='+encodeURIComponent($('tb2').value)

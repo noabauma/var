@@ -57,7 +57,8 @@ DEFAULT_CFG = {
     "confirm_frames": 3,                # consecutive identical readings
     "game_to": 10,                      # a game ends at this score
     "games_to_win": 2,                  # best of three
-    "auto_open_betting": True,
+    "auto_open_betting": False,  # side effect on the real board — off while testing
+    "auto_enter": False,         # testing phase: log results, never write them
     # measured on the rotated table, 2026-07-15 (mono 1280x720).
     # The boxes are generous search windows (the table shifts a little
     # during play) — the bead band is located inside them every frame.
@@ -65,12 +66,12 @@ DEFAULT_CFG = {
     # is decoration (deco_ends): the scoring-end group is reduced by one.
     # The table rotation makes rail A read point-symmetrically to B:
     # A scores toward high y, B toward low y.
-    "beads_a": {"x": 195, "y": 260, "w": 105, "h": 330, "axis": "y",
+    "beads_a": {"x": 195, "y": 260, "w": 105, "h": 270, "axis": "y",
                 "score_end": "high", "thresh": 80, "total_beads": 12,
                 "band_px": 36, "rail_px": 270, "pitch_px": 15.5, "deco_ends": True},
-    "beads_b": {"x": 1030, "y": 190, "w": 110, "h": 320, "axis": "y",
-                "score_end": "low", "thresh": 80, "total_beads": 12,
-                "band_px": 36, "rail_px": 270, "pitch_px": 16, "deco_ends": True},
+    "beads_b": {"x": 1030, "y": 230, "w": 110, "h": 285, "axis": "y",
+                "score_end": "low", "thresh": 95, "total_beads": 12,
+                "band_px": 36, "rail_px": 270, "pitch_px": 15, "deco_ends": True},
     "row_frac": 0.25,                   # band row counts as "bead" above this
     "occlusion_frac": 0.6,              # band covered more than this = hand
 }
@@ -147,7 +148,11 @@ def count_beads(img, roi, cfg):
     crop = img[y:y + h, x:x + w]
     if crop.size == 0:
         return 0, True
-    bw = crop >= roi.get("thresh", 90)
+    # per-frame Otsu threshold: the camera's auto-exposure shifts constantly
+    # with people moving, so a fixed threshold goes stale within minutes.
+    # roi["thresh"] acts as a floor so a beadless dark strip can't split.
+    otsu, _ = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bw = crop >= max(otsu * 0.85, roi.get("thresh", 60) * 0.6)
     # solid bright stripes (the white table edge) fill the whole window
     # height; beads never do — mask such columns out before locating
     if roi["axis"] == "y":
@@ -383,17 +388,24 @@ def main_loop(cfg):
                           f"{game_scores[-1]} — games {ga}-{gb}")
                     if max(ga, gb) >= cfg["games_to_win"]:
                         games = ",".join(f"{a}-{b}" for a, b in game_scores)
-                        q = urllib.parse.urlencode({"a": teams[0],
-                                                    "b": teams[1],
-                                                    "games": games})
-                        try:
-                            resp = json.loads(http(base, "/scores/add?" + q,
-                                                   post=True))
-                            print("result entered:", teams, games, resp)
-                        except Exception as e:
-                            print("auto-entry failed:", e)
+                        if cfg.get("auto_enter", False):
+                            q = urllib.parse.urlencode({"a": teams[0],
+                                                        "b": teams[1],
+                                                        "games": games})
+                            try:
+                                resp = json.loads(http(base,
+                                                       "/scores/add?" + q,
+                                                       post=True))
+                                print("result entered:", teams, games, resp)
+                            except Exception as e:
+                                print("auto-entry failed:", e)
+                            note = "match over — remove the cards"
+                        else:
+                            print(f"TEST MODE — would enter: {teams[0]} vs "
+                                  f"{teams[1]} games {games} (auto_enter off)")
+                            note = "match over (test mode: not entered)"
                         publish(base, True, teams[0], teams[1], 0, 0, ga, gb,
-                                "match over — remove the cards")
+                                note)
                         state = "DONE"
 
         dt = time.monotonic() - t0

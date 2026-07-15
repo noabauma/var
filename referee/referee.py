@@ -69,7 +69,7 @@ DEFAULT_CFG = {
     "beads_a": {"x": 195, "y": 260, "w": 105, "h": 270, "axis": "y",
                 "score_end": "high", "thresh": 80, "total_beads": 12,
                 "band_px": 36, "rail_px": 270, "pitch_px": 15.5, "deco_ends": True},
-    "beads_b": {"x": 1030, "y": 230, "w": 110, "h": 300, "axis": "y",
+    "beads_b": {"x": 1030, "y": 230, "w": 110, "h": 285, "axis": "y",
                 "score_end": "high", "thresh": 95, "total_beads": 12,
                 "band_px": 36, "rail_px": 270, "pitch_px": 15, "deco_ends": True},
     "row_frac": 0.25,                   # band row counts as "bead" above this
@@ -148,44 +148,45 @@ def count_beads(img, roi, cfg):
     crop = img[y:y + h, x:x + w]
     if crop.size == 0:
         return 0, True
-    # threshold is scanned, not assumed: auto-exposure churns constantly
-    # and window-wide Otsu is misled by bright walls. The 12-bead target
-    # (below) arbitrates which threshold/band combination is the real rail.
+    # per-frame Otsu threshold: the camera's auto-exposure shifts constantly
+    # with people moving, so a fixed threshold goes stale within minutes.
+    # roi["thresh"] acts as a floor so a beadless dark strip can't split.
     otsu, _ = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    base_t = roi.get("thresh", 60)
-    ladder = sorted({int(v) for v in (base_t * 0.6, base_t * 0.85, base_t,
-                                      otsu * 0.55, otsu * 0.7, otsu * 0.85)
-                     if v >= 35})
+    bw = crop >= max(otsu * 0.85, roi.get("thresh", 60) * 0.6)
+    # solid bright stripes (the white table edge) fill the whole window
+    # height; beads never do — mask such columns out before locating
+    if roi["axis"] == "y":
+        bw[:, bw.mean(axis=0) > 0.85] = False
+    else:
+        bw[bw.mean(axis=1) > 0.85, :] = False
+    # the ROI is a search window: locate the bead band inside it, so a
+    # shifted table doesn't need recalibration. A Gaussian prior centered
+    # on the window keeps nearby bright stripes (table edges) from winning.
     band = roi.get("band_px", 36)
     axis_y = roi["axis"] == "y"
+    n_cross = bw.shape[1] if axis_y else bw.shape[0]
+    # scan every candidate band position and keep the one whose bead-row
+    # total is closest to the physical expectation (total_beads * pitch):
+    # deterministic, memory-free, and edge stripes/junk can't qualify
     target = roi.get("total_beads", 12) * roi.get("pitch_px", 19)
-    cands = []  # (longest_run, -err, on-rows, bw) across thresholds & bands
-    for th in ladder:
-        bw_t = crop >= th
-        # solid bright stripes (table edges) fill the whole window height;
-        # beads never do — mask such columns before locating
-        if axis_y:
-            bw_t[:, bw_t.mean(axis=0) > 0.85] = False
-        else:
-            bw_t[bw_t.mean(axis=1) > 0.85, :] = False
-        n_cross = bw_t.shape[1] if axis_y else bw_t.shape[0]
-        for o in range(0, max(1, n_cross - band + 1), 2):
-            sub = bw_t[:, o:o + band] if axis_y else bw_t[o:o + band, :]
-            prof = sub.mean(axis=1 if axis_y else 0)
-            on_c = (prof > cfg["row_frac"]) & (prof < 0.92)
-            err = abs(int(on_c.sum()) - target)
-            if err <= target * 0.30:
-                # longest consecutive run = the bead cluster; junk is speckle
-                longest = cur = 0
-                for v in on_c:
-                    cur = cur + 1 if v else 0
-                    longest = max(longest, cur)
-                cands.append((longest, -err, on_c, sub))
+    cands = []  # (longest_run, -err, offset, on-rows) per candidate band
+    for o in range(0, max(1, n_cross - band + 1), 2):
+        sub = bw[:, o:o + band] if axis_y else bw[o:o + band, :]
+        prof = sub.mean(axis=1 if axis_y else 0)
+        on_c = (prof > cfg["row_frac"]) & (prof < 0.92)
+        err = abs(int(on_c.sum()) - target)
+        if err <= target * 0.30:
+            # longest consecutive run = the bead cluster; junk is speckle
+            longest = cur = 0
+            for v in on_c:
+                cur = cur + 1 if v else 0
+                longest = max(longest, cur)
+            cands.append((longest, -err, o, on_c))
     if not cands:
         return 0, True  # no believable rail in the window (occlusion/move)
-    # closest to the 12-bead target wins; the longest run (bead cluster)
-    # only breaks ties between equally-close candidates
-    _, nerr, on, sub = max(cands, key=lambda c: (c[1], c[0]))
+    _, nerr, b0, on = max(cands)
+    err = -nerr
+    sub = bw[:, b0:b0 + band] if axis_y else bw[b0:b0 + band, :]
     frac = float(np.count_nonzero(sub)) / sub.size
     if frac > cfg["occlusion_frac"]:
         return 0, True  # something large covers the rail (a hand/arm)

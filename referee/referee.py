@@ -68,10 +68,10 @@ DEFAULT_CFG = {
     # A scores toward high y, B toward low y.
     "beads_a": {"x": 195, "y": 260, "w": 105, "h": 270, "axis": "y",
                 "score_end": "high", "thresh": 80, "total_beads": 12,
-                "band_px": 36, "rail_px": 270, "pitch_px": 15.5, "deco_ends": True},
+                "band_px": 36, "rail_px": 295, "pitch_px": 15.5, "deco_ends": True},
     "beads_b": {"x": 1030, "y": 230, "w": 110, "h": 285, "axis": "y",
                 "score_end": "high", "thresh": 95, "total_beads": 12,
-                "band_px": 36, "rail_px": 270, "pitch_px": 15, "deco_ends": True},
+                "band_px": 36, "rail_px": 295, "pitch_px": 15, "deco_ends": True},
     "row_frac": 0.25,                   # band row counts as "bead" above this
     "occlusion_frac": 0.6,              # band covered more than this = hand
 }

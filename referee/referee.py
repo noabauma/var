@@ -58,15 +58,21 @@ DEFAULT_CFG = {
     "game_to": 10,                      # a game ends at this score
     "games_to_win": 2,                  # best of three
     "auto_open_betting": True,
-    # measured on the rotated table, 2026-07-15 (mono 1280x720):
-    # left rail = A (thresh ~90), right rail = B (dimmer beads, thresh ~45);
-    # beads slide toward the top (low y) when scoring on both rails
-    "beads_a": {"x": 222, "y": 295, "w": 52, "h": 235, "axis": "y",
-                "score_end": "low", "thresh": 60, "total_beads": 12},
-    "beads_b": {"x": 1055, "y": 225, "w": 62, "h": 250, "axis": "y",
-                "score_end": "low", "thresh": 45, "total_beads": 11},
-    "row_frac": 0.25,                   # rail row counts as "bead" above this
-    "occlusion_frac": 0.6,              # ROI covered more than this = hand
+    # measured on the rotated table, 2026-07-15 (mono 1280x720).
+    # The boxes are generous search windows (the table shifts a little
+    # during play) — the bead band is located inside them every frame.
+    # Each rail carries 12 beads of which the outermost one at each end
+    # is decoration (deco_ends): the scoring-end group is reduced by one.
+    # The table rotation makes rail A read point-symmetrically to B:
+    # A scores toward high y, B toward low y.
+    "beads_a": {"x": 195, "y": 260, "w": 105, "h": 330, "axis": "y",
+                "score_end": "high", "thresh": 60, "total_beads": 12,
+                "band_px": 36, "rail_px": 270, "deco_ends": True},
+    "beads_b": {"x": 1030, "y": 190, "w": 110, "h": 320, "axis": "y",
+                "score_end": "low", "thresh": 45, "total_beads": 12,
+                "band_px": 36, "rail_px": 270, "deco_ends": True},
+    "row_frac": 0.25,                   # band row counts as "bead" above this
+    "occlusion_frac": 0.6,              # band covered more than this = hand
 }
 
 
@@ -120,11 +126,34 @@ def count_beads(img, roi, cfg):
     if crop.size == 0:
         return 0, True
     bw = crop >= roi.get("thresh", 90)
+    # solid bright stripes (the white table edge) fill the whole window
+    # height; beads never do — mask such columns out before locating
+    if roi["axis"] == "y":
+        bw[:, bw.mean(axis=0) > 0.85] = False
+    else:
+        bw[bw.mean(axis=1) > 0.85, :] = False
+    # the ROI is a search window: locate the bead band inside it, so a
+    # shifted table doesn't need recalibration. A Gaussian prior centered
+    # on the window keeps nearby bright stripes (table edges) from winning.
+    band = roi.get("band_px", 36)
+    cross = bw.sum(axis=0 if roi["axis"] == "y" else 1).astype(float)
+    b0 = 0
+    if len(cross) > band:
+        sums = np.convolve(cross, np.ones(band), "valid")
+        centers = np.arange(len(sums)) + band / 2.0
+        # prior around where the rail was last seen (falls back to the
+        # window middle) — tracks slow table drift, rejects edge stripes
+        mid = roi.get("_band_c", len(cross) / 2.0)
+        sigma = len(cross) / 6.0
+        sums *= np.exp(-0.5 * ((centers - mid) / sigma) ** 2)
+        b0 = int(np.argmax(sums))
+        bw = bw[:, b0:b0 + band] if roi["axis"] == "y" else bw[b0:b0 + band, :]
     frac = float(np.count_nonzero(bw)) / bw.size
     if frac > cfg["occlusion_frac"]:
         return 0, True  # something large covers the rail (a hand/arm)
     profile = bw.mean(axis=1 if roi["axis"] == "y" else 0)
-    on = profile > cfg["row_frac"]
+    # a row filled edge-to-edge is a solid table edge, not a bead
+    on = (profile > cfg["row_frac"]) & (profile < 0.92)
     runs = []  # (start, length) of consecutive bead rows
     start = None
     for i, v in enumerate(on):
@@ -138,8 +167,28 @@ def count_beads(img, roi, cfg):
     runs = [r for r in runs if r[1] >= 4]  # drop specks
     if not runs:
         return 0, False
+    # the physical rail is rail_px long (deco bead to deco bead): keep only
+    # the best rail-length span of runs — kills edges/handles at the window
+    # borders no matter what they look like
+    span = roi.get("rail_px", 0)
+    if span and (runs[-1][0] + runs[-1][1] - runs[0][0]) > span:
+        conv = np.convolve(on.astype(float), np.ones(span), "valid")
+        o = int(np.argmax(conv))
+        clipped = []
+        for s, l in runs:
+            s2, e2 = max(s, o), min(s + l, o + span)
+            if e2 - s2 >= 4:
+                clipped.append((s2, e2 - s2))
+        runs = clipped
+        if not runs:
+            return 0, False
     total_len = sum(l for _, l in runs)
-    pitch = total_len / max(1, roi.get("total_beads", 11))
+    pitch = total_len / max(1, roi.get("total_beads", 12))
+    # remember the band position only when the reading looks like a real
+    # rail (sane bead pitch) — junk must not poison the tracking memory
+    if 13 <= pitch <= 26:
+        roi["_band_c"] = b0 + band / 2.0
+    deco = 1 if roi.get("deco_ends") else 0
     if len(runs) == 1:
         return 0, False  # single cluster = nothing slid out = score 0
     # split the runs at the largest inter-run gap
@@ -149,11 +198,14 @@ def count_beads(img, roi, cfg):
     low_len = sum(l for _, l in runs[:gi + 1])
     high_len = total_len - low_len
     seg = low_len if roi["score_end"] == "low" else high_len
-    return int(round(seg / pitch)), False
+    # the outermost bead at the scoring end is decoration, not a goal
+    return max(0, int(round(seg / pitch)) - deco), False
 
 
 class Stable:
-    """A value that must repeat `n` times in a row before it is believed."""
+    """A value that must repeat `n` times in a row before it is believed.
+    Implausible jumps (more than 2 goals at once — junk readings from a
+    bumped table or partial occlusion) need twice the confirmations."""
 
     def __init__(self, n):
         self.n = n
@@ -167,7 +219,10 @@ class Stable:
         else:
             self.cand = v
             self.count = 1
-        if self.count >= self.n:
+        need = self.n
+        if self.value is not None and abs(v - self.value) > 2:
+            need = self.n * 2
+        if self.count >= need:
             self.value = v
         return self.value
 

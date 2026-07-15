@@ -66,11 +66,11 @@ DEFAULT_CFG = {
     # The table rotation makes rail A read point-symmetrically to B:
     # A scores toward high y, B toward low y.
     "beads_a": {"x": 195, "y": 260, "w": 105, "h": 330, "axis": "y",
-                "score_end": "high", "thresh": 60, "total_beads": 12,
-                "band_px": 36, "rail_px": 270, "pitch_px": 19, "deco_ends": True},
-    "beads_b": {"x": 1030, "y": 190, "w": 110, "h": 320, "axis": "y",
-                "score_end": "low", "thresh": 45, "total_beads": 12,
+                "score_end": "high", "thresh": 80, "total_beads": 12,
                 "band_px": 36, "rail_px": 270, "pitch_px": 15.5, "deco_ends": True},
+    "beads_b": {"x": 1030, "y": 190, "w": 110, "h": 320, "axis": "y",
+                "score_end": "low", "thresh": 80, "total_beads": 12,
+                "band_px": 36, "rail_px": 270, "pitch_px": 16, "deco_ends": True},
     "row_frac": 0.25,                   # band row counts as "bead" above this
     "occlusion_frac": 0.6,              # band covered more than this = hand
 }

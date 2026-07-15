@@ -102,12 +102,29 @@ def get_frame(base):
 # --------------------------------------------------------------- detection
 
 def detect_cards(img, dictionary):
-    """Returns {marker_id: (cx, cy)} for every detected marker."""
+    """Returns {marker_id: (center_xy, corner_pts)} for every marker."""
     corners, ids, _ = cv2.aruco.detectMarkers(img, dictionary)
     out = {}
     if ids is not None:
         for c, i in zip(corners, ids.flatten()):
-            out[int(i)] = tuple(c[0].mean(axis=0))
+            pts = c[0]
+            out[int(i)] = (tuple(pts.mean(axis=0)), pts)
+    return out
+
+
+def mask_cards(img, detected, scale=3.0):
+    """Blacks out every detected card (marker bbox inflated to cover the
+    white paper around it) so the bright card can never be counted as
+    beads — the cards sit right next to the rails by design."""
+    out = img.copy()
+    for _, (_, pts) in detected.items():
+        x0, y0 = pts.min(axis=0)
+        x1, y1 = pts.max(axis=0)
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        hw, hh = (x1 - x0) / 2.0 * scale, (y1 - y0) / 2.0 * scale
+        a, b = max(0, int(cx - hw)), max(0, int(cy - hh))
+        c, d = min(out.shape[1], int(cx + hw)), min(out.shape[0], int(cy + hh))
+        out[b:d, a:c] = 0
     return out
 
 
@@ -136,24 +153,27 @@ def count_beads(img, roi, cfg):
     # shifted table doesn't need recalibration. A Gaussian prior centered
     # on the window keeps nearby bright stripes (table edges) from winning.
     band = roi.get("band_px", 36)
-    cross = bw.sum(axis=0 if roi["axis"] == "y" else 1).astype(float)
-    b0 = 0
-    if len(cross) > band:
-        sums = np.convolve(cross, np.ones(band), "valid")
-        centers = np.arange(len(sums)) + band / 2.0
-        # prior around where the rail was last seen (falls back to the
-        # window middle) — tracks slow table drift, rejects edge stripes
-        mid = roi.get("_band_c", len(cross) / 2.0)
-        sigma = len(cross) / 6.0
-        sums *= np.exp(-0.5 * ((centers - mid) / sigma) ** 2)
-        b0 = int(np.argmax(sums))
-        bw = bw[:, b0:b0 + band] if roi["axis"] == "y" else bw[b0:b0 + band, :]
-    frac = float(np.count_nonzero(bw)) / bw.size
+    axis_y = roi["axis"] == "y"
+    n_cross = bw.shape[1] if axis_y else bw.shape[0]
+    # scan every candidate band position and keep the one whose bead-row
+    # total is closest to the physical expectation (total_beads * pitch):
+    # deterministic, memory-free, and edge stripes/junk can't qualify
+    target = roi.get("total_beads", 12) * roi.get("pitch_px", 19)
+    best = (None, 1e9, None)  # (offset, error, on-rows)
+    for o in range(0, max(1, n_cross - band + 1), 2):
+        sub = bw[:, o:o + band] if axis_y else bw[o:o + band, :]
+        prof = sub.mean(axis=1 if axis_y else 0)
+        on_c = (prof > cfg["row_frac"]) & (prof < 0.92)
+        err = abs(int(on_c.sum()) - target)
+        if err < best[1]:
+            best = (o, err, on_c)
+    b0, err, on = best
+    if on is None or err > target * 0.30:
+        return 0, True  # no believable rail in the window (occlusion/move)
+    sub = bw[:, b0:b0 + band] if axis_y else bw[b0:b0 + band, :]
+    frac = float(np.count_nonzero(sub)) / sub.size
     if frac > cfg["occlusion_frac"]:
         return 0, True  # something large covers the rail (a hand/arm)
-    profile = bw.mean(axis=1 if roi["axis"] == "y" else 0)
-    # a row filled edge-to-edge is a solid table edge, not a bead
-    on = (profile > cfg["row_frac"]) & (profile < 0.92)
     runs = []  # (start, length) of consecutive bead rows
     start = None
     for i, v in enumerate(on):
@@ -184,10 +204,8 @@ def count_beads(img, roi, cfg):
             return 0, False
     total_len = sum(l for _, l in runs)
     pitch = total_len / max(1, roi.get("total_beads", 12))
-    # remember the band position only when the reading looks like a real
-    # rail (sane bead pitch) — junk must not poison the tracking memory
-    if 13 <= pitch <= 26:
-        roi["_band_c"] = b0 + band / 2.0
+    if not (13 <= pitch <= 26):
+        return 0, True  # implausible bead size: not a clean rail reading
     deco = 1 if roi.get("deco_ends") else 0
     if len(runs) == 1:
         return 0, False  # single cluster = nothing slid out = score 0
@@ -269,8 +287,9 @@ def main_loop(cfg):
             time.sleep(2)
             continue
 
-        cards = {i: p for i, p in detect_cards(img, dictionary).items()
-                 if i in mapping}
+        detected = detect_cards(img, dictionary)
+        clean = mask_cards(img, detected)  # cards never pollute the rails
+        cards = {i: p for i, (p, _) in detected.items() if i in mapping}
 
         if state == "IDLE":
             if len(cards) == 2:
@@ -279,10 +298,13 @@ def main_loop(cfg):
                     ids = sorted(cards)
                     print("cards seen:", [mapping[i] for i in ids])
                 elif t0 - cards_since >= cfg["card_stable_s"]:
-                    ids = sorted(cards, key=lambda i: cards[i][1])  # by y:
-                    # the card nearer beads_a belongs to side A
-                    ya = cfg["beads_a"]["y"]
-                    ids = sorted(cards, key=lambda i: abs(cards[i][1] - ya))
+                    # the card physically closer to rail A belongs to side A
+                    ra, rb = cfg["beads_a"], cfg["beads_b"]
+                    ca = (ra["x"] + ra["w"] / 2, ra["y"] + ra["h"] / 2)
+                    def dist(i, c):
+                        return ((cards[i][0] - c[0]) ** 2 +
+                                (cards[i][1] - c[1]) ** 2) ** 0.5
+                    ids = sorted(cards, key=lambda i: dist(i, ca))
                     a_id, b_id = ids[0], ids[1]
                     teams = (mapping[a_id], mapping[b_id])
                     state = "MATCH"
@@ -314,8 +336,8 @@ def main_loop(cfg):
                 continue
 
             if state == "MATCH":
-                ra, occa = count_beads(img, cfg["beads_a"], cfg)
-                rb, occb = count_beads(img, cfg["beads_b"], cfg)
+                ra, occa = count_beads(clean, cfg["beads_a"], cfg)
+                rb, occb = count_beads(clean, cfg["beads_b"], cfg)
                 if not occa:
                     sa_f.feed(min(ra, cfg["game_to"]))
                 if not occb:
@@ -365,27 +387,57 @@ def calibrate(cfg):
     img = get_frame(cfg["base_url"])
     out = os.path.join(HERE, "calibration.jpg")
     cv2.imwrite(out, img)
-    # draw the current ROIs for reference
-    vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    # exactly the runtime pipeline: detect the cards and mask them out
+    dictionary = cv2.aruco.Dictionary_get(getattr(cv2.aruco, cfg["aruco_dict"]))
+    detected = detect_cards(img, dictionary)
+    clean = mask_cards(img, detected)
+    # draw the current ROIs and detected cards for reference
+    vis = cv2.cvtColor(clean, cv2.COLOR_GRAY2BGR)
     for name, color in (("beads_a", (0, 255, 0)), ("beads_b", (0, 0, 255))):
         r = cfg[name]
         cv2.rectangle(vis, (r["x"], r["y"]),
                       (r["x"] + r["w"], r["y"] + r["h"]), color, 2)
         cv2.putText(vis, name, (r["x"], r["y"] - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    for mid, (ctr, _) in detected.items():
+        cv2.putText(vis, f"card {mid}", (int(ctr[0]) - 30, int(ctr[1])),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 220), 2)
     cv2.imwrite(os.path.join(HERE, "calibration_rois.jpg"), vis)
     print(f"wrote {out} and calibration_rois.jpg — adjust the beads_* ROIs "
           f"in referee.json until each box tightly frames one bead rail, "
           f"then rerun calibrate to check")
-    ra, oa = count_beads(img, cfg["beads_a"], cfg)
-    rb, ob = count_beads(img, cfg["beads_b"], cfg)
+    if detected:
+        print("cards detected:", sorted(detected))
+    ra, oa = count_beads(clean, cfg["beads_a"], cfg)
+    rb, ob = count_beads(clean, cfg["beads_b"], cfg)
     print(f"current reading: A={ra}{' (occluded)' if oa else ''} "
           f"B={rb}{' (occluded)' if ob else ''}")
+
+
+def watch(cfg):
+    """Live readings once per second — slide beads at the table and check
+    that the numbers follow. '?' marks a rejected (occluded/unclear) read."""
+    dictionary = cv2.aruco.Dictionary_get(getattr(cv2.aruco, cfg["aruco_dict"]))
+    print("watching (Ctrl-C to stop) — A | B | cards")
+    while True:
+        try:
+            img = get_frame(cfg["base_url"])
+            detected = detect_cards(img, dictionary)
+            clean = mask_cards(img, detected)
+            a, oa = count_beads(clean, cfg["beads_a"], cfg)
+            b, ob = count_beads(clean, cfg["beads_b"], cfg)
+            print(f"A={a}{'?' if oa else ' '}  B={b}{'?' if ob else ' '}  "
+                  f"cards={sorted(detected)}")
+        except Exception as e:
+            print("(", e, ")")
+        time.sleep(1.0)
 
 
 if __name__ == "__main__":
     config = load_cfg()
     if len(sys.argv) > 1 and sys.argv[1] == "calibrate":
         calibrate(config)
+    elif len(sys.argv) > 1 and sys.argv[1] == "watch":
+        watch(config)
     else:
         main_loop(config)

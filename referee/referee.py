@@ -67,10 +67,10 @@ DEFAULT_CFG = {
     # A scores toward high y, B toward low y.
     "beads_a": {"x": 195, "y": 260, "w": 105, "h": 330, "axis": "y",
                 "score_end": "high", "thresh": 60, "total_beads": 12,
-                "band_px": 36, "rail_px": 270, "deco_ends": True},
+                "band_px": 36, "rail_px": 270, "pitch_px": 19, "deco_ends": True},
     "beads_b": {"x": 1030, "y": 190, "w": 110, "h": 320, "axis": "y",
                 "score_end": "low", "thresh": 45, "total_beads": 12,
-                "band_px": 36, "rail_px": 270, "deco_ends": True},
+                "band_px": 36, "rail_px": 270, "pitch_px": 15.5, "deco_ends": True},
     "row_frac": 0.25,                   # band row counts as "bead" above this
     "occlusion_frac": 0.6,              # band covered more than this = hand
 }
@@ -112,19 +112,24 @@ def detect_cards(img, dictionary):
     return out
 
 
-def mask_cards(img, detected, scale=3.0):
-    """Blacks out every detected card (marker bbox inflated to cover the
-    white paper around it) so the bright card can never be counted as
-    beads — the cards sit right next to the rails by design."""
+def mask_cards(img, detected):
+    """Blacks out every detected card using its *oriented* print geometry
+    (A5 landscape, marker on the right, digit to the left — gen_cards.py),
+    so tilted cards are covered exactly: no white paper leaks into the
+    bead count, and no rail pixels beyond the card are eaten."""
     out = img.copy()
     for _, (_, pts) in detected.items():
-        x0, y0 = pts.min(axis=0)
-        x1, y1 = pts.max(axis=0)
-        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        hw, hh = (x1 - x0) / 2.0 * scale, (y1 - y0) / 2.0 * scale
-        a, b = max(0, int(cx - hw)), max(0, int(cy - hh))
-        c, d = min(out.shape[1], int(cx + hw)), min(out.shape[0], int(cy + hh))
-        out[b:d, a:c] = 0
+        c = pts.mean(axis=0)
+        # unit-side vectors: edge midpoint minus center is half a side long
+        right = ((pts[1] + pts[2]) / 2.0 - c) * 2.0
+        up = ((pts[0] + pts[1]) / 2.0 - c) * 2.0
+        # in marker-side units the card spans right +0.61 / left -1.65 /
+        # up&down 0.80 around the marker center; ~10% print/detect margin
+        poly = np.array([c + 0.72 * right + 0.82 * up,
+                         c + 0.72 * right - 0.82 * up,
+                         c - 1.85 * right - 0.82 * up,
+                         c - 1.85 * right + 0.82 * up])
+        cv2.fillConvexPoly(out, poly.astype(np.int32), 0)
     return out
 
 
@@ -159,17 +164,23 @@ def count_beads(img, roi, cfg):
     # total is closest to the physical expectation (total_beads * pitch):
     # deterministic, memory-free, and edge stripes/junk can't qualify
     target = roi.get("total_beads", 12) * roi.get("pitch_px", 19)
-    best = (None, 1e9, None)  # (offset, error, on-rows)
+    cands = []  # (longest_run, -err, offset, on-rows) per candidate band
     for o in range(0, max(1, n_cross - band + 1), 2):
         sub = bw[:, o:o + band] if axis_y else bw[o:o + band, :]
         prof = sub.mean(axis=1 if axis_y else 0)
         on_c = (prof > cfg["row_frac"]) & (prof < 0.92)
         err = abs(int(on_c.sum()) - target)
-        if err < best[1]:
-            best = (o, err, on_c)
-    b0, err, on = best
-    if on is None or err > target * 0.30:
+        if err <= target * 0.30:
+            # longest consecutive run = the bead cluster; junk is speckle
+            longest = cur = 0
+            for v in on_c:
+                cur = cur + 1 if v else 0
+                longest = max(longest, cur)
+            cands.append((longest, -err, o, on_c))
+    if not cands:
         return 0, True  # no believable rail in the window (occlusion/move)
+    _, nerr, b0, on = max(cands)
+    err = -nerr
     sub = bw[:, b0:b0 + band] if axis_y else bw[b0:b0 + band, :]
     frac = float(np.count_nonzero(sub)) / sub.size
     if frac > cfg["occlusion_frac"]:
@@ -206,6 +217,12 @@ def count_beads(img, roi, cfg):
     pitch = total_len / max(1, roi.get("total_beads", 12))
     if not (13 <= pitch <= 26):
         return 0, True  # implausible bead size: not a clean rail reading
+    # the full bead count must be accounted for — if any beads are hidden
+    # (mask overlap, hand, bad light) refuse to read rather than misread
+    expected = roi.get("total_beads", 12)
+    seen = total_len / float(roi.get("pitch_px", 19))
+    if abs(seen - expected) > 1.5:
+        return 0, True
     deco = 1 if roi.get("deco_ends") else 0
     if len(runs) == 1:
         return 0, False  # single cluster = nothing slid out = score 0

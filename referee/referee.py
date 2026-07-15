@@ -58,14 +58,15 @@ DEFAULT_CFG = {
     "game_to": 10,                      # a game ends at this score
     "games_to_win": 2,                  # best of three
     "auto_open_betting": True,
-    "beads_a": {"x": 265, "y": 300, "w": 60, "h": 220, "axis": "y",
-                "score_end": "high"},
-    "beads_b": {"x": 265, "y": 470, "w": 60, "h": 220, "axis": "y",
-                "score_end": "high"},
-    "bead_min_px": 40,                  # min blob area (px) to count as bead
-    "bead_max_px": 900,
-    "bright_thresh": 150,               # bead brightness threshold (mono)
-    "occlusion_frac": 0.5,              # ROI covered more than this = hand
+    # measured on the rotated table, 2026-07-15 (mono 1280x720):
+    # left rail = A (thresh ~90), right rail = B (dimmer beads, thresh ~45);
+    # beads slide toward the top (low y) when scoring on both rails
+    "beads_a": {"x": 222, "y": 295, "w": 52, "h": 235, "axis": "y",
+                "score_end": "low", "thresh": 60, "total_beads": 12},
+    "beads_b": {"x": 1055, "y": 225, "w": 62, "h": 250, "axis": "y",
+                "score_end": "low", "thresh": 45, "total_beads": 11},
+    "row_frac": 0.25,                   # rail row counts as "bead" above this
+    "occlusion_frac": 0.6,              # ROI covered more than this = hand
 }
 
 
@@ -107,41 +108,48 @@ def detect_cards(img, dictionary):
 def count_beads(img, roi, cfg):
     """Counts beads on the scoring side of the rail ROI.
 
-    Beads are bright blobs on the dark rail. They are clustered by the
-    largest gap along the rail axis; the group at the `score_end` end is
-    the score. Returns (score, occluded).
+    Touching beads merge into one blob, so blobs are useless — instead the
+    bright mask is projected onto the rail axis into bead/no-bead runs.
+    The rail always carries `total_beads`, so the per-frame bead pitch is
+    (total run length / total_beads); the run group on the `score_end`
+    side of the largest gap, divided by the pitch, is the score.
+    Returns (score, occluded).
     """
     x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
     crop = img[y:y + h, x:x + w]
     if crop.size == 0:
         return 0, True
-    _, bw = cv2.threshold(crop, cfg["bright_thresh"], 255, cv2.THRESH_BINARY)
+    bw = crop >= roi.get("thresh", 90)
     frac = float(np.count_nonzero(bw)) / bw.size
     if frac > cfg["occlusion_frac"]:
-        return 0, True  # something big and bright covers the rail (a hand)
-    n, _, stats, cents = cv2.connectedComponentsWithStats(bw)
-    beads = []
-    for i in range(1, n):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if cfg["bead_min_px"] <= area <= cfg["bead_max_px"]:
-            c = cents[i]
-            beads.append(c[1] if roi["axis"] == "y" else c[0])
-    if not beads:
+        return 0, True  # something large covers the rail (a hand/arm)
+    profile = bw.mean(axis=1 if roi["axis"] == "y" else 0)
+    on = profile > cfg["row_frac"]
+    runs = []  # (start, length) of consecutive bead rows
+    start = None
+    for i, v in enumerate(on):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append((start, i - start))
+            start = None
+    if start is not None:
+        runs.append((start, len(on) - start))
+    runs = [r for r in runs if r[1] >= 4]  # drop specks
+    if not runs:
         return 0, False
-    beads.sort()
-    if len(beads) == 1:
-        # a single blob: several touching beads can merge — treat as unknown
-        # cluster on the non-scoring side = 0
-        return 0, False
-    # split at the largest gap along the axis
-    gaps = [b - a for a, b in zip(beads, beads[1:])]
+    total_len = sum(l for _, l in runs)
+    pitch = total_len / max(1, roi.get("total_beads", 11))
+    if len(runs) == 1:
+        return 0, False  # single cluster = nothing slid out = score 0
+    # split the runs at the largest inter-run gap
+    gaps = [runs[i + 1][0] - (runs[i][0] + runs[i][1])
+            for i in range(len(runs) - 1)]
     gi = int(np.argmax(gaps))
-    typical = np.median([g for g in gaps if g > 0]) or 1.0
-    if gaps[gi] < 2.5 * typical:
-        return 0, False  # no real gap: all beads in one cluster = score 0
-    low_group = gi + 1
-    high_group = len(beads) - low_group
-    return (high_group if roi["score_end"] == "high" else low_group), False
+    low_len = sum(l for _, l in runs[:gi + 1])
+    high_len = total_len - low_len
+    seg = low_len if roi["score_end"] == "low" else high_len
+    return int(round(seg / pitch)), False
 
 
 class Stable:

@@ -70,7 +70,7 @@ DEFAULT_CFG = {
                 "score_end": "high", "thresh": 80, "total_beads": 12,
                 "band_px": 36, "rail_px": 270, "pitch_px": 15.5, "deco_ends": True},
     "beads_b": {"x": 1030, "y": 230, "w": 110, "h": 285, "axis": "y",
-                "score_end": "low", "thresh": 95, "total_beads": 12,
+                "score_end": "high", "thresh": 95, "total_beads": 12,
                 "band_px": 36, "rail_px": 270, "pitch_px": 15, "deco_ends": True},
     "row_frac": 0.25,                   # band row counts as "bead" above this
     "occlusion_frac": 0.6,              # band covered more than this = hand
@@ -237,9 +237,24 @@ def count_beads(img, roi, cfg):
     gi = int(np.argmax(gaps))
     low_len = sum(l for _, l in runs[:gi + 1])
     high_len = total_len - low_len
-    seg = low_len if roi["score_end"] == "low" else high_len
+    se = roi.get("_score_end", roi["score_end"])  # per-match learned override
+    seg = low_len if se == "low" else high_len
     # the outermost bead at the scoring end is decoration, not a goal
     return max(0, int(round(seg / pitch)) - deco), False
+
+
+def learn_score_end(img, roi, cfg):
+    """Which way do the beads slide to score *this* match? Players differ.
+    At match start (beads reset) the big cluster marks the rest end, so
+    the scoring end is the opposite side. None = can't tell (occluded or
+    beads not reset)."""
+    lo = dict(roi); lo["score_end"] = "low"; lo.pop("_score_end", None)
+    hi = dict(roi); hi["score_end"] = "high"; hi.pop("_score_end", None)
+    sl, ol = count_beads(img, lo, cfg)
+    sh, oh = count_beads(img, hi, cfg)
+    if ol or oh or sl == sh:
+        return None
+    return "high" if sl > sh else "low"  # score away from the big cluster
 
 
 class Stable:
@@ -333,6 +348,13 @@ def main_loop(cfg):
                     game_scores, game_hi = [], [0, 0]
                     sa_f = Stable(cfg["confirm_frames"])
                     sb_f = Stable(cfg["confirm_frames"])
+                    # players slide beads whichever way they like: learn the
+                    # scoring direction from the reset rails at match start
+                    for rn in ("beads_a", "beads_b"):
+                        end = learn_score_end(clean, cfg[rn], cfg)
+                        if end:
+                            cfg[rn]["_score_end"] = end
+                            print(f"  {rn}: scoring toward '{end}' this match")
                     print(f"MATCH MODE: {teams[0]} vs {teams[1]}")
                     publish(base, True, teams[0], teams[1], 0, 0, 0, 0,
                             "match detected")
@@ -355,6 +377,8 @@ def main_loop(cfg):
                 state = "IDLE"
                 teams = None
                 cards_since = None
+                cfg["beads_a"].pop("_score_end", None)  # next match relearns
+                cfg["beads_b"].pop("_score_end", None)
                 continue
 
             if state == "MATCH":

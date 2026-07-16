@@ -1,0 +1,42 @@
+{
+  "base_url": "http://127.0.0.1:8081",
+  "poll_fps": 2.0,
+  "aruco_dict": "DICT_4X4_50",
+  "cards_map": "cards/mapping.json",
+  "card_stable_s": 5.0,
+  "confirm_frames": 3,
+  "game_to": 10,
+  "games_to_win": 2,
+  "auto_open_betting": false,
+  "beads_a": {
+    "x": 195,
+    "y": 260,
+    "w": 105,
+    "h": 270,
+    "axis": "y",
+    "score_end": "high",
+    "thresh": 80,
+    "total_beads": 12,
+    "band_px": 36,
+    "deco_ends": true,
+    "rail_px": 295,
+    "pitch_px": 15.5
+  },
+  "beads_b": {
+    "x": 1030,
+    "y": 230,
+    "w": 110,
+    "h": 285,
+    "axis": "y",
+    "score_end": "high",
+    "thresh": 95,
+    "total_beads": 12,
+    "band_px": 36,
+    "deco_ends": true,
+    "rail_px": 295,
+    "pitch_px": 15
+  },
+  "row_frac": 0.25,
+  "occlusion_frac": 0.6,
+  "auto_enter": false
+}

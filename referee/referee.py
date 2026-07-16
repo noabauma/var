@@ -94,7 +94,28 @@ def http(base, path, post=False):
         return r.read()
 
 
-def get_frame(base):
+_cap = None
+
+
+def get_frame(base, cfg=None):
+    """Frame source. Default: the recorder's /frame (shares the VAR camera).
+    Set "video_source": "/dev/videoN" in referee.json to give the referee
+    its OWN camera (e.g. the FullHD color cam) while the OV9281 keeps doing
+    120fps slow-mo — two devices, no conflict. Color frames are converted
+    to grayscale for now; hue-based bead segmentation can hook in here."""
+    global _cap
+    src = (cfg or {}).get("video_source", "")
+    if src.startswith("/dev/"):
+        if _cap is None:
+            _cap = cv2.VideoCapture(src)
+            _cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            _cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        ok, frame = _cap.read()
+        if not ok:
+            _cap.release()
+            _cap = None
+            raise RuntimeError(f"cannot read {src}")
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     data = http(base, "/frame")
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
     return img
@@ -318,7 +339,7 @@ def main_loop(cfg):
     while True:
         t0 = time.monotonic()
         try:
-            img = get_frame(base)
+            img = get_frame(base, cfg)
         except Exception as e:
             print("frame fetch failed:", e)
             time.sleep(2)
@@ -437,7 +458,7 @@ def main_loop(cfg):
 
 
 def calibrate(cfg):
-    img = get_frame(cfg["base_url"])
+    img = get_frame(cfg["base_url"], cfg)
     out = os.path.join(HERE, "calibration.jpg")
     cv2.imwrite(out, img)
     # exactly the runtime pipeline: detect the cards and mask them out
@@ -474,7 +495,7 @@ def watch(cfg):
     print("watching (Ctrl-C to stop) — A | B | cards")
     while True:
         try:
-            img = get_frame(cfg["base_url"])
+            img = get_frame(cfg["base_url"], cfg)
             detected = detect_cards(img, dictionary)
             clean = mask_cards(img, detected)
             a, oa = count_beads(clean, cfg["beads_a"], cfg)

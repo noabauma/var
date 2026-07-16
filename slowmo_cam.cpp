@@ -2479,6 +2479,11 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
     +'&name='+encodeURIComponent(nv.trim()),{method:'POST'})).json();
     if(!r.ok)alert(r.error);else{if(playingRec===f.name)playingRec=null;recsPoll();}}catch(e){}};
   nm.appendChild(rb);
+  const dl=document.createElement('button');dl.textContent='⬇';dl.className='mbtn';
+  dl.title='download this clip';
+  dl.onclick=ev=>{ev.stopPropagation();
+   location.href='/recordings/download?file='+encodeURIComponent(f.name);};
+  nm.appendChild(dl);
   const db=document.createElement('button');db.textContent='🗑';db.className='mbtn';
   db.title='delete this clip (permanent)';
   db.onclick=async ev=>{ev.stopPropagation();
@@ -3234,6 +3239,38 @@ static void handle_recording_rename(int fd, const Cfg &cfg, Shared *sh,
 }
 
 // POST /recordings/delete?file=X — permanent; the web page confirms first
+// GET /recordings/download?file=X — the clip as a file download
+static void handle_recording_download(int fd, const Cfg &cfg, Shared *sh,
+                                      const std::string &path) {
+    std::string name = query_str(path, "file");
+    if (!safe_clip_name(name)) {
+        send_simple(fd, sh, "400 Bad Request", "text/plain", "bad file name\n");
+        return;
+    }
+    std::string full = cfg.out_dir + "/" + name;
+    FILE *fh = std::fopen(full.c_str(), "rb");
+    if (!fh) {
+        send_simple(fd, sh, "404 Not Found", "text/plain", "no such clip\n");
+        return;
+    }
+    fseek(fh, 0, SEEK_END);
+    long size = ftell(fh);
+    fseek(fh, 0, SEEK_SET);
+    char h[512];
+    int n = std::snprintf(h, sizeof h,
+                          "HTTP/1.1 200 OK\r\nContent-Type: video/x-msvideo\r\n"
+                          "Content-Length: %ld\r\n"
+                          "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                          "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                          size, name.c_str());
+    bool ok = send_all(fd, h, (size_t)n, sh);
+    char buf[1 << 16];
+    size_t r;
+    while (ok && (r = std::fread(buf, 1, sizeof buf, fh)) > 0)
+        ok = send_all(fd, buf, r, sh);
+    std::fclose(fh);
+}
+
 static void handle_recording_delete(int fd, const Cfg &cfg, Shared *sh,
                                     const std::string &path) {
     std::string fname = query_str(path, "file");
@@ -3278,6 +3315,8 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_save(fd, cfg, sh);
         else if (method == "GET" && route == "/recordings")
             handle_recordings(fd, cfg, sh);
+        else if (method == "GET" && route == "/recordings/download")
+            handle_recording_download(fd, cfg, sh, path);
         else if (method == "POST" && route == "/recordings/rename")
             handle_recording_rename(fd, cfg, sh, path);
         else if (method == "POST" && route == "/recordings/delete")

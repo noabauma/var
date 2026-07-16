@@ -2502,8 +2502,17 @@ async function post(u){try{const r=await(await fetch(u,{method:'POST'})).json();
  if(!r.ok){$('serr').textContent=r.error;return false;}
  $('serr').textContent='';scores();return true;}catch(e){return false;}}
 function fmtGames(m,fromA){return m.games.map(g=>fromA?g[0]+'-'+g[1]:g[1]+'-'+g[0]).join(', ');}
-function renderDetail(){const d=$('detail');if(selTeam<0||!S){d.hidden=true;return;}
+let renderedTeam=-1,detailBusy=false;
+function renderDetail(){const d=$('detail');
+ if(selTeam<0||!S){d.hidden=true;renderedTeam=-1;detailBusy=false;return;}
+ // never rebuild the panel under someone's fingers: skip the periodic
+ // refresh while an input inside it has focus or unsaved keystrokes
+ const ae=document.activeElement;
+ const editing=d.contains(ae)&&ae.tagName==='INPUT';
+ if(!d.hidden&&selTeam===renderedTeam&&(detailBusy||editing))return;
+ renderedTeam=selTeam;detailBusy=false;
  d.hidden=false;d.innerHTML='';
+ d.oninput=()=>{detailBusy=true;};
  const me=S.teams[selTeam].name;
  const h=document.createElement('div');h.className='dh';
  const nm=document.createElement('b');nm.textContent=me;h.appendChild(nm);
@@ -2522,7 +2531,7 @@ function renderDetail(){const d=$('detail');if(selTeam<0||!S){d.hidden=true;retu
   inp.value=pl[k]||'';pf.appendChild(inp);pin.push(inp);});
  const pb=document.createElement('button');pb.textContent='Save players';
  pf.appendChild(pb);
- pf.onsubmit=e=>{e.preventDefault();
+ pf.onsubmit=e=>{e.preventDefault();detailBusy=false;renderedTeam=-1;
   post('/scores/team/players?team='+enc(me)+'&p1='+enc(pin[0].value)
    +'&p2='+enc(pin[1].value)+'&res='+enc(pin[2].value));};
  d.appendChild(pf);
@@ -2551,7 +2560,7 @@ function renderDetail(){const d=$('detail');if(selTeam<0||!S){d.hidden=true;retu
  const ri=document.createElement('input');ri.maxLength=40;ri.placeholder='rename to…';
  rf.appendChild(ri);
  const rb=document.createElement('button');rb.textContent='Rename';rf.appendChild(rb);
- rf.onsubmit=e=>{e.preventDefault();
+ rf.onsubmit=e=>{e.preventDefault();detailBusy=false;renderedTeam=-1;
   post('/scores/rename?team='+enc(me)+'&name='+enc(ri.value));};
  const td=document.createElement('button');td.type='button';td.textContent='Delete team';
  td.className='danger';

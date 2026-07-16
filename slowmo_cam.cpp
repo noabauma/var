@@ -43,6 +43,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <ctime>
 #include <deque>
@@ -355,12 +357,14 @@ private:
 
 struct ScoreBoard; // tournament rankings, defined after the capture threads
 struct BetBoard;   // virtual betting, defined after ScoreBoard
+struct Transcoder; // background AVI -> MP4 conversion
 
 struct Shared {
     Ring ring;
     MessageQueue msgs;
     ScoreBoard *scores = nullptr; // web scoreboard (null = disabled)
     BetBoard *bets = nullptr;     // virtual betting (null = disabled)
+    Transcoder *xcode = nullptr;  // background MP4 conversion (null = off)
 
     // live-match state, published by the CV referee (referee/referee.py)
     // and shown as a banner on the page
@@ -825,16 +829,24 @@ static std::string clip_path(const Cfg &cfg) {
 
 // Auto-saved clips are the only prune candidates; a clip renamed away from
 // the slowmo_* pattern (web UI ✎) is kept forever.
-static bool is_autoclip(const std::string &n) {
-    return n.size() > 11 && n.compare(0, 7, "slowmo_") == 0 &&
-           n.compare(n.size() - 4, 4, ".avi") == 0;
+static bool has_ext(const std::string &n, const char *ext) {
+    size_t l = strlen(ext);
+    return n.size() > l && n.compare(n.size() - l, l, ext) == 0;
 }
 
-// A clip name as it may appear in URLs and renames: a plain *.avi basename —
-// no path tricks, no hidden files, only tame characters.
+static bool is_clip_file(const std::string &n) {
+    return has_ext(n, ".avi") || has_ext(n, ".mp4");
+}
+
+static bool is_autoclip(const std::string &n) {
+    return n.size() > 11 && n.compare(0, 7, "slowmo_") == 0 && is_clip_file(n);
+}
+
+// A clip name as it may appear in URLs and renames: a plain *.avi/*.mp4
+// basename — no path tricks, no hidden files, only tame characters.
 static bool safe_clip_name(const std::string &n) {
     if (n.size() < 5 || n.size() > 96) return false;
-    if (n[0] == '.' || n.compare(n.size() - 4, 4, ".avi") != 0) return false;
+    if (n[0] == '.' || !is_clip_file(n)) return false;
     for (char c : n)
         if (!(isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-' ||
               c == ' ' || c == '(' || c == ')'))
@@ -858,9 +870,9 @@ static std::vector<ClipInfo> list_clips(const Cfg &cfg) {
     dirent *e;
     while ((e = readdir(d)) != nullptr) {
         std::string n = e->d_name;
-        if (n.size() < 5 || n[0] == '.' ||
-            n.compare(n.size() - 4, 4, ".avi") != 0)
+        if (n.size() < 5 || n[0] == '.' || !is_clip_file(n))
             continue;
+        if (has_ext(n, ".part.mp4")) continue; // transcode in progress
         ClipInfo ci;
         ci.name = n;
         ci.kept = !is_autoclip(n);
@@ -870,9 +882,11 @@ static std::vector<ClipInfo> list_clips(const Cfg &cfg) {
             ci.bytes = (uint64_t)st.st_size;
             ci.mtime = st.st_mtime;
         }
-        avi::Reader r;
-        std::string err;
-        if (r.open(full, err)) { ci.frames = r.frames; ci.fps = r.fps; }
+        if (has_ext(n, ".avi")) {
+            avi::Reader r;
+            std::string err;
+            if (r.open(full, err)) { ci.frames = r.frames; ci.fps = r.fps; }
+        }
         out.push_back(std::move(ci));
     }
     closedir(d);
@@ -906,6 +920,91 @@ static void prune_clips(const Cfg &cfg, Shared *sh) {
     sh->msgs.push(msg);
 }
 
+// ------------------------------------------------------------- transcoder
+// Saves stay instant (lossless MJPEG-AVI remux from RAM); this worker then
+// converts each clip to H.264 MP4 on the Pi's hardware encoder in the
+// background and removes the AVI. MP4 plays natively in the browser
+// (scrub/pause) and downloads ~6x smaller. A failed conversion keeps the
+// AVI, which still plays through the legacy MJPEG replay path.
+struct Transcoder {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::string> q;
+    std::thread worker;
+    std::atomic<pid_t> cur{-1}; // in-flight ffmpeg, killed on shutdown
+    Shared *sh = nullptr;
+
+    void enqueue(const std::string &avi_path) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            q.push_back(avi_path);
+        }
+        cv.notify_one();
+    }
+
+    void start(Shared *s) {
+        sh = s;
+        worker = std::thread(&Transcoder::run, this);
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            q.clear(); // unfinished AVIs are re-enqueued on next start
+        }
+        cv.notify_one();
+        pid_t p = cur.load();
+        if (p > 0) kill(p, SIGKILL); // don't wait ~40s for a running encode
+        if (worker.joinable()) worker.join();
+    }
+
+    void run() {
+        while (true) {
+            std::string src;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait_for(lk, std::chrono::milliseconds(300), [&] {
+                    return !q.empty() || !sh->alive;
+                });
+                if (!sh->alive) return;
+                if (q.empty()) continue;
+                src = q.front();
+                q.pop_front();
+            }
+            if (access(src.c_str(), F_OK) != 0 || !has_ext(src, ".avi"))
+                continue;
+            std::string dst = src.substr(0, src.size() - 4) + ".mp4";
+            if (access(dst.c_str(), F_OK) == 0) continue; // already converted
+            std::string part = dst + ".part.mp4";
+            Child c = spawn({"nice", "-n", "10", "ffmpeg", "-y", "-v", "error",
+                             "-i", src, "-c:v", "h264_v4l2m2m", "-b:v", "4M",
+                             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                             part},
+                            false, true);
+            if (c.pid < 0) continue;
+            cur = c.pid;
+            int st = 0;
+            waitpid(c.pid, &st, 0);
+            cur = -1;
+            struct stat pst{};
+            bool ok = WIFEXITED(st) && WEXITSTATUS(st) == 0 &&
+                      stat(part.c_str(), &pst) == 0 && pst.st_size > 1024;
+            char msg[256];
+            if (ok && rename(part.c_str(), dst.c_str()) == 0) {
+                unlink(src.c_str());
+                std::snprintf(msg, sizeof msg, "converted %s (%.1f MB)",
+                              basename_of(dst).c_str(), pst.st_size / 1e6);
+            } else {
+                unlink(part.c_str());
+                std::snprintf(msg, sizeof msg,
+                              "transcode failed for %s — keeping the AVI",
+                              basename_of(src).c_str());
+            }
+            sh->msgs.push(msg);
+        }
+    }
+};
+
 static void saver_thread(std::shared_ptr<const Snapshot> snap, Cfg cfg,
                          Shared *sh, std::string path) {
     TrThreadGuard tr_guard;
@@ -935,6 +1034,7 @@ static void saver_thread(std::shared_ptr<const Snapshot> snap, Cfg cfg,
         INSTRUMENTATION_MARK_SET(TR_CH_SAVER, g_tr.prune, 0);
         prune_clips(cfg, sh);
         INSTRUMENTATION_MARK_RESET(TR_CH_SAVER);
+        if (sh->xcode) sh->xcode->enqueue(path); // background MP4 conversion
     }
     sh->save_busy = false;
 }
@@ -2203,6 +2303,8 @@ main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10p
 @media(max-width:1279px){main{flex-direction:column}#wrap{order:-1}
 #scorepane{order:1;width:100%;max-width:1280px;max-height:none}}
 #cam{width:100%;display:block;border-radius:10px;background:#000;aspect-ratio:16/9;object-fit:contain}
+#vid{width:100%;display:block;border-radius:10px;background:#000;aspect-ratio:16/9}
+#vid[hidden]{display:none}
 #badge{position:absolute;top:12px;left:12px;background:#c0231d;color:#fff;font-weight:700;padding:4px 12px;border-radius:6px;letter-spacing:1px;font-size:13px;animation:p 1s infinite}
 #privacy{position:absolute;inset:0;background:#0b0e12;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:26px;font-weight:700;color:#8b96a5}
 #privacy[hidden]{display:none}
@@ -2329,7 +2431,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 </aside>
-<div id="wrap"><img id="cam" src="/stream" alt="live"><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="livematch" hidden></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
+<div id="wrap"><img id="cam" src="/stream" alt="live"><video id="vid" controls playsinline hidden></video><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="livematch" hidden></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
 </main>
 <footer>
 <button id="save">&#128308; Save + replay</button>
@@ -2417,12 +2519,17 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st');
 let timer=0,replayFrames=0,playFps=30,slow=4,recs=[],playingRec=null;
 function live(){clearTimeout(timer);badge.hidden=true;playingRec=null;renderRecs();
+  const v=$('vid');if(!v.hidden){v.pause();v.removeAttribute('src');v.load();v.hidden=true;}
+  cam.hidden=false;
   const r=localStorage.getItem('streamfps')||'';
   cam.src='/stream?'+(r?'fps='+r+'&':'')+'t='+Date.now();}
 function replay(sec){clearTimeout(timer);badge.textContent='REPLAY '+slow+'× SLOW-MO';badge.hidden=false;
   cam.src='/replay?t='+Date.now();if(sec>0)timer=setTimeout(live,sec*1000+400);}
 function replayRec(name,sec){clearTimeout(timer);playingRec=name;renderRecs();
-  badge.textContent='REPLAY '+name.replace(/\.avi$/,'');badge.hidden=false;
+  badge.textContent='REPLAY '+name.replace(/\.(avi|mp4)$/,'');badge.hidden=false;
+  if(name.endsWith('.mp4')){ // native player: pause/scrub, exits via Live
+   cam.hidden=true;const v=$('vid');v.hidden=false;
+   v.src='/recordings/file?file='+encodeURIComponent(name);v.play();return;}
   cam.src='/replay?file='+encodeURIComponent(name)+'&t='+Date.now();
   if(sec>0)timer=setTimeout(live,sec*1000+400);}
 function updAgain(){$('again').disabled=!replayFrames&&!recs.length;}
@@ -2467,7 +2574,7 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
   const nm=document.createElement('div');nm.className='nm';
   if(f.kept){const k=document.createElement('b');k.className='keep';k.textContent='★';
    k.title='renamed — never auto-pruned';nm.appendChild(k);}
-  const s=document.createElement('span');s.textContent=f.name.replace(/\.avi$/,'');
+  const s=document.createElement('span');s.textContent=f.name.replace(/\.(avi|mp4)$/,'');
   nm.appendChild(s);
   const rb=document.createElement('button');rb.textContent='✎';rb.className='mbtn';
   rb.title='rename (renamed clips are kept forever)';
@@ -2863,7 +2970,8 @@ static void send_simple(int fd, Shared *sh, const char *status,
 
 // Read the request head; returns "METHOD /path" split. Body (none expected
 // beyond an empty POST) is ignored.
-static bool read_request(int fd, std::string &method, std::string &path) {
+static bool read_request(int fd, std::string &method, std::string &path,
+                         std::string *range = nullptr) {
     char buf[4096];
     size_t used = 0;
     while (used < sizeof buf - 1) {
@@ -2877,6 +2985,16 @@ static bool read_request(int fd, std::string &method, std::string &path) {
     if (std::sscanf(buf, "%7s %2047s", m, p) != 2) return false;
     method = m;
     path = p;
+    if (range) { // "Range: bytes=..." — the <video> player seeks with it
+        range->clear();
+        const char *h = strcasestr(buf, "\r\nRange:");
+        if (h) {
+            h += 8;
+            while (*h == ' ') h++;
+            const char *e = strstr(h, "\r\n");
+            if (e) range->assign(h, e - h);
+        }
+    }
     return true;
 }
 
@@ -3210,8 +3328,9 @@ static void handle_recording_rename(int fd, const Cfg &cfg, Shared *sh,
     newn = a == std::string::npos
                ? ""
                : newn.substr(a, newn.find_last_not_of(' ') - a + 1);
-    if (newn.size() < 4 || newn.compare(newn.size() - 4, 4, ".avi") != 0)
-        newn += ".avi";
+    std::string ext = has_ext(oldn, ".mp4") ? ".mp4" : ".avi";
+    if (newn.size() < 4 || !is_clip_file(newn))
+        newn += ext;
     std::string err;
     if (!safe_clip_name(oldn))
         err = "bad file name";
@@ -3239,9 +3358,11 @@ static void handle_recording_rename(int fd, const Cfg &cfg, Shared *sh,
 }
 
 // POST /recordings/delete?file=X — permanent; the web page confirms first
-// GET /recordings/download?file=X — the clip as a file download
-static void handle_recording_download(int fd, const Cfg &cfg, Shared *sh,
-                                      const std::string &path) {
+// Serves a clip file. attachment=true adds Content-Disposition (download);
+// otherwise it supports HTTP Range so the <video> player can seek.
+static void serve_clip_file(int fd, const Cfg &cfg, Shared *sh,
+                            const std::string &path, const std::string &range,
+                            bool attachment) {
     std::string name = query_str(path, "file");
     if (!safe_clip_name(name)) {
         send_simple(fd, sh, "400 Bad Request", "text/plain", "bad file name\n");
@@ -3255,19 +3376,50 @@ static void handle_recording_download(int fd, const Cfg &cfg, Shared *sh,
     }
     fseek(fh, 0, SEEK_END);
     long size = ftell(fh);
-    fseek(fh, 0, SEEK_SET);
-    char h[512];
-    int n = std::snprintf(h, sizeof h,
-                          "HTTP/1.1 200 OK\r\nContent-Type: video/x-msvideo\r\n"
-                          "Content-Length: %ld\r\n"
-                          "Content-Disposition: attachment; filename=\"%s\"\r\n"
+    long from = 0, to = size - 1;
+    bool partial = false;
+    if (!attachment && range.compare(0, 6, "bytes=") == 0) {
+        // "bytes=from-" or "bytes=from-to" (single range only)
+        char *end;
+        long f = strtol(range.c_str() + 6, &end, 10);
+        if (end != range.c_str() + 6 && f >= 0 && f < size) {
+            from = f;
+            if (*end == '-' && *(end + 1))
+                to = std::min(size - 1, strtol(end + 1, nullptr, 10));
+            partial = true;
+        }
+    }
+    fseek(fh, from, SEEK_SET);
+    const char *ctype = has_ext(name, ".mp4") ? "video/mp4" : "video/x-msvideo";
+    char h[640];
+    int n;
+    if (partial)
+        n = std::snprintf(h, sizeof h,
+                          "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\n"
+                          "Content-Length: %ld\r\nAccept-Ranges: bytes\r\n"
+                          "Content-Range: bytes %ld-%ld/%ld\r\n"
+                          "Connection: close\r\n\r\n",
+                          ctype, to - from + 1, from, to, size);
+    else
+        n = std::snprintf(h, sizeof h,
+                          "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
+                          "Content-Length: %ld\r\nAccept-Ranges: bytes\r\n"
+                          "%s%s%s"
                           "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
-                          size, name.c_str());
+                          ctype, size,
+                          attachment ? "Content-Disposition: attachment; filename=\"" : "",
+                          attachment ? name.c_str() : "",
+                          attachment ? "\"\r\n" : "");
     bool ok = send_all(fd, h, (size_t)n, sh);
     char buf[1 << 16];
-    size_t r;
-    while (ok && (r = std::fread(buf, 1, sizeof buf, fh)) > 0)
+    long left = to - from + 1;
+    while (ok && left > 0) {
+        size_t want = (size_t)std::min(left, (long)sizeof buf);
+        size_t r = std::fread(buf, 1, want, fh);
+        if (r == 0) break;
         ok = send_all(fd, buf, r, sh);
+        left -= (long)r;
+    }
     std::fclose(fh);
 }
 
@@ -3295,8 +3447,8 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
-    std::string method, path;
-    if (read_request(fd, method, path)) {
+    std::string method, path, range_hdr;
+    if (read_request(fd, method, path, &range_hdr)) {
         std::string route = path.substr(0, path.find('?'));
         // one event per short request; the long-lived streams instrument
         // their per-frame sends instead, each on its own lane
@@ -3316,7 +3468,9 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
         else if (method == "GET" && route == "/recordings")
             handle_recordings(fd, cfg, sh);
         else if (method == "GET" && route == "/recordings/download")
-            handle_recording_download(fd, cfg, sh, path);
+            serve_clip_file(fd, cfg, sh, path, "", true);
+        else if (method == "GET" && route == "/recordings/file")
+            serve_clip_file(fd, cfg, sh, path, range_hdr, false);
         else if (method == "POST" && route == "/recordings/rename")
             handle_recording_rename(fd, cfg, sh, path);
         else if (method == "POST" && route == "/recordings/delete")
@@ -3751,7 +3905,17 @@ int main(int argc, char **argv) {
 
     ScoreBoard scores; // declared before sh: outlives the web client threads
     BetBoard bets;
+    Transcoder xcode;
     Shared sh(cfg.max_frames(), (size_t)cfg.capture_fps);
+    if (cfg.selftest == 0 && has_cmd("ffmpeg")) {
+        sh.xcode = &xcode;
+        xcode.start(&sh);
+        // self-migration: convert clips that are still AVI (older saves,
+        // or a conversion that was interrupted by a shutdown)
+        for (const auto &ci : list_clips(cfg))
+            if (has_ext(ci.name, ".avi"))
+                xcode.enqueue(cfg.out_dir + "/" + ci.name);
+    }
     if (!cfg.no_scores && cfg.http_port > 0 && cfg.selftest == 0) {
         if (access(cfg.scores_script.c_str(), F_OK) != 0) {
             std::fprintf(stderr, "warning: score script not found (%s) — "
@@ -3794,6 +3958,7 @@ int main(int argc, char **argv) {
     if (http.joinable()) http.join(); // unblocks + waits for web clients
     if (sh.save_busy) std::printf("finishing save ...\n");
     sh.join_saver();
+    if (sh.xcode) xcode.stop(); // pending AVIs are re-enqueued on next start
     INSTRUMENTATION_ADD_NUM_CHANNELS(TR_CH_STREAM0 + TR_STREAM_LANES);
     INSTRUMENTATION_END();
     for (const auto &m : sh.msgs.drain()) std::printf("  %s\n", m.c_str());

@@ -51,7 +51,13 @@ browse `http://<pi-ip>:8081` — only do this if 443 isn't internet-exposed.
 On the page: live view, status bar (fps / buffer / drops / 👁 viewer count),
 **Save + replay**, **Replay last**, **Live**, fullscreen (⛶/`f`), and a
 **recordings panel** (click to replay a clip, ✎ rename = keep forever,
-🗑 delete). Keys: `space` save, `r` replay, `f` fullscreen, `l`/`esc` live.
+⬇ download, 🗑 delete). Keys: `space` save, `r` replay, `f` fullscreen,
+`l`/`esc` live. Saves are written instantly as lossless MJPEG-AVI, then a
+background worker converts them to **H.264 MP4 on the Pi's hardware
+encoder** (~35 s, ~6x smaller) and removes the AVI — so clips in
+`~/recordings` are MP4: they play in a native `<video>` player with
+pause/scrubbing and download small. AVIs still around (older saves,
+failed conversions) keep working via the legacy MJPEG replay.
 
 **🎲 Virtual betting (no money, just glory):** spectators and players sign
 in with just a name, someone opens betting on the match about to start,

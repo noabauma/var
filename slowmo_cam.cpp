@@ -2433,7 +2433,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button id="algb" class="on">Bias PageRank</button>
 <button id="algp">Classic PageRank</button>
 <label id="dwrap" title="PageRank damping factor d (admin only, not persisted)">d
-<input id="dsl" type="range" min="0.50" max="0.99" step="0.01" value="0.85">
+<input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">
 <span id="dval">0.85</span></label>
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
@@ -2825,7 +2825,7 @@ function drawRankHist(){const svg=$('rhsvg');if(!svg||!HIST)return;
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
- if(S.d&&document.activeElement!==$('dsl')){ // don't fight the dragging hand
+ if(S.d!==undefined&&document.activeElement!==$('dsl')){ // don't fight the dragging hand
   $('dsl').value=S.d;$('dval').textContent=(+S.d).toFixed(2);}
  renderTable();renderDetail();rankhist();}catch(e){}}
 $('algb').onclick=()=>{alg='bias';renderTable();};

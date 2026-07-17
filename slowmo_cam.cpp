@@ -2347,9 +2347,13 @@ button:disabled{opacity:.4;cursor:default}
 #af input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;min-width:8em;flex:1}
 #af button{padding:9px 14px}
 #serr{color:#e57373;font-size:13px;min-height:1.2em;margin-top:6px}
-#algsw{display:flex;gap:8px;margin-bottom:10px}
+#algsw{display:flex;gap:8px;margin-bottom:10px;align-items:center}
+#algsw[hidden]{display:none}
 #algsw button{flex:1;padding:7px 8px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
 #algsw button.on{background:#1c2530;border-color:#3b82f6;color:#fff}
+#dwrap{display:flex;align-items:center;gap:5px;font-size:12px;color:#8b96a5;white-space:nowrap}
+#dwrap input{width:70px;accent-color:#3b82f6}
+#dval{min-width:30px;color:#e6e9ee}
 #scorepane tbody tr{cursor:pointer}
 #scorepane tbody tr:hover td,#scorepane tr.sel td{background:#141a21}
 #detail{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:12px;margin-top:10px;font-size:14px}
@@ -2425,9 +2429,12 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <main>
 <aside id="scorepane">
 <h2>Tournament</h2>
-<div id="algsw">
+<div id="algsw" hidden>
 <button id="algb" class="on">Bias PageRank</button>
 <button id="algp">Classic PageRank</button>
+<label id="dwrap" title="PageRank damping factor d (admin only, not persisted)">d
+<input id="dsl" type="range" min="0.50" max="0.99" step="0.01" value="0.85">
+<span id="dval">0.85</span></label>
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 </aside>
@@ -2559,6 +2566,8 @@ cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
   replayFrames=s.replay_frames;playFps=s.playback_fps;slow=Math.round(s.capture_fps/s.playback_fps);
   updAgain();
   camOn=s.cam_on!==false;
+  if(isAdmin!==(s.admin===true)){isAdmin=s.admin===true;
+   $('algsw').hidden=!isAdmin;renderRecs();}
   $('camtoggle').textContent=camOn?'📷 Camera ON':'📷 Camera OFF';
   $('camtoggle').className=camOn?'':'off';
   $('privacy').hidden=camOn||!badge.hidden;
@@ -2586,11 +2595,12 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
     +'&name='+encodeURIComponent(nv.trim()),{method:'POST'})).json();
     if(!r.ok)alert(r.error);else{if(playingRec===f.name)playingRec=null;recsPoll();}}catch(e){}};
   nm.appendChild(rb);
-  const dl=document.createElement('button');dl.textContent='⬇';dl.className='mbtn';
-  dl.title='download this clip';
-  dl.onclick=ev=>{ev.stopPropagation();
-   location.href='/recordings/download?file='+encodeURIComponent(f.name);};
-  nm.appendChild(dl);
+  if(isAdmin){ // server refuses non-admin downloads anyway; don't tease
+   const dl=document.createElement('button');dl.textContent='⬇';dl.className='mbtn';
+   dl.title='download this clip (admin)';
+   dl.onclick=ev=>{ev.stopPropagation();
+    location.href='/recordings/download?file='+encodeURIComponent(f.name);};
+   nm.appendChild(dl);}
   const db=document.createElement('button');db.textContent='🗑';db.className='mbtn';
   db.title='delete this clip (permanent)';
   db.onclick=async ev=>{ev.stopPropagation();
@@ -2608,7 +2618,7 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
 async function recsPoll(){try{const r=await(await fetch('/recordings')).json();
  if(r.ok){recs=r.files;renderRecs();updAgain();}}catch(e){}}
 recsPoll();setInterval(recsPoll,15000);
-let S=null,alg='bias',selTeam=-1,gHl=null,gHlOff=null,camOn=true;
+let S=null,alg='bias',selTeam=-1,gHl=null,gHlOff=null,camOn=true,isAdmin=false;
 const enc=encodeURIComponent;
 async function post(u){try{const r=await(await fetch(u,{method:'POST'})).json();
  if(!r.ok){$('serr').textContent=r.error;return false;}
@@ -2815,9 +2825,13 @@ function drawRankHist(){const svg=$('rhsvg');if(!svg||!HIST)return;
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
+ if(S.d&&document.activeElement!==$('dsl')){ // don't fight the dragging hand
+  $('dsl').value=S.d;$('dval').textContent=(+S.d).toFixed(2);}
  renderTable();renderDetail();rankhist();}catch(e){}}
 $('algb').onclick=()=>{alg='bias';renderTable();};
 $('algp').onclick=()=>{alg='plain';renderTable();};
+$('dsl').oninput=()=>{$('dval').textContent=(+$('dsl').value).toFixed(2);};
+$('dsl').onchange=()=>post('/scores/d?value='+$('dsl').value);
 $('af').addEventListener('submit',async e=>{e.preventDefault();
  try{const r=await(await fetch('/scores/add?a='+encodeURIComponent($('ta').value)
   +'&b='+encodeURIComponent($('tb2').value)
@@ -2971,7 +2985,8 @@ static void send_simple(int fd, Shared *sh, const char *status,
 // Read the request head; returns "METHOD /path" split. Body (none expected
 // beyond an empty POST) is ignored.
 static bool read_request(int fd, std::string &method, std::string &path,
-                         std::string *range = nullptr) {
+                         std::string *range = nullptr,
+                         std::string *user = nullptr) {
     char buf[4096];
     size_t used = 0;
     while (used < sizeof buf - 1) {
@@ -2985,16 +3000,19 @@ static bool read_request(int fd, std::string &method, std::string &path,
     if (std::sscanf(buf, "%7s %2047s", m, p) != 2) return false;
     method = m;
     path = p;
-    if (range) { // "Range: bytes=..." — the <video> player seeks with it
-        range->clear();
-        const char *h = strcasestr(buf, "\r\nRange:");
-        if (h) {
-            h += 8;
-            while (*h == ' ') h++;
-            const char *e = strstr(h, "\r\n");
-            if (e) range->assign(h, e - h);
-        }
-    }
+    auto header = [&](const char *name, std::string *out) {
+        out->clear();
+        const char *h = strcasestr(buf, name);
+        if (!h) return;
+        h += strlen(name);
+        while (*h == ' ') h++;
+        const char *e = strstr(h, "\r\n");
+        if (e) out->assign(h, e - h);
+    };
+    if (range) // "Range: bytes=..." — the <video> player seeks with it
+        header("\r\nRange:", range);
+    if (user)  // set by nginx to the authenticated basic-auth account
+        header("\r\nX-Remote-User:", user);
     return true;
 }
 
@@ -3211,18 +3229,18 @@ static void handle_save(int fd, const Cfg &cfg, Shared *sh) {
     send_simple(fd, sh, "200 OK", "application/json", body);
 }
 
-static void handle_status(int fd, const Cfg &cfg, Shared *sh) {
+static void handle_status(int fd, const Cfg &cfg, Shared *sh, bool admin) {
     size_t fill = sh->ring.size() * 100 / cfg.max_frames();
     if (fill > 100) fill = 100;
     auto snap = sh->get_last_snap();
     char body[512];
     std::snprintf(body, sizeof body,
-                  "{\"camera\":%s,\"cam_on\":%s,\"viewers\":%d,\"fps\":%.1f,"
-                  "\"buffer_pct\":%zu,\"frames\":%zu,"
+                  "{\"admin\":%s,\"camera\":%s,\"cam_on\":%s,\"viewers\":%d,"
+                  "\"fps\":%.1f,\"buffer_pct\":%zu,\"frames\":%zu,"
                   "\"drops\":%llu,\"save_busy\":%s,\"last_clip\":\"%s\","
                   "\"replay_frames\":%zu,\"capture_fps\":%d,"
                   "\"playback_fps\":%d,\"buffer_seconds\":%.1f}",
-                  sh->cam_ok ? "true" : "false",
+                  admin ? "true" : "false", sh->cam_ok ? "true" : "false",
                   sh->cam_enabled ? "true" : "false", sh->viewers.load(),
                   sh->ring.measured_fps(), fill, sh->ring.size(),
                   (unsigned long long)sh->drops.load(),
@@ -3447,8 +3465,12 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
-    std::string method, path, range_hdr;
-    if (read_request(fd, method, path, &range_hdr)) {
+    std::string method, path, range_hdr, remote_user;
+    if (read_request(fd, method, path, &range_hdr, &remote_user)) {
+        // nginx stamps X-Remote-User with the logged-in basic-auth account.
+        // No header at all = the request didn't come through the proxy
+        // (127.0.0.1: SSH tunnel or the TV on the Pi itself) = the owner.
+        bool admin = remote_user.empty() || remote_user == "admin";
         std::string route = path.substr(0, path.find('?'));
         // one event per short request; the long-lived streams instrument
         // their per-frame sends instead, each on its own lane
@@ -3467,8 +3489,13 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_save(fd, cfg, sh);
         else if (method == "GET" && route == "/recordings")
             handle_recordings(fd, cfg, sh);
-        else if (method == "GET" && route == "/recordings/download")
-            serve_clip_file(fd, cfg, sh, path, "", true);
+        else if (method == "GET" && route == "/recordings/download") {
+            if (!admin)
+                send_simple(fd, sh, "403 Forbidden", "application/json",
+                            "{\"ok\":false,\"error\":\"downloads are admin-only\"}");
+            else
+                serve_clip_file(fd, cfg, sh, path, "", true);
+        }
         else if (method == "GET" && route == "/recordings/file")
             serve_clip_file(fd, cfg, sh, path, range_hdr, false);
         else if (method == "POST" && route == "/recordings/rename")
@@ -3536,7 +3563,7 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
         }
         else if (method == "GET" && route == "/status")
-            handle_status(fd, cfg, sh);
+            handle_status(fd, cfg, sh, admin);
         else if (method == "GET" && route == "/scores")
             handle_scores(fd, sh);
         else if (method == "GET" && route == "/scores/history" && sh->scores)
@@ -3616,9 +3643,13 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
                             err);
         } else if (method == "POST" && route == "/scores/d" && sh->scores) {
             std::string err;
-            scores_mutation(fd, sh,
-                            sh->scores->set_damping(query_str(path, "value"), err),
-                            err);
+            if (!admin)
+                scores_error(fd, sh, "403 Forbidden", "damping is admin-only");
+            else
+                scores_mutation(fd, sh,
+                                sh->scores->set_damping(query_str(path, "value"),
+                                                        err),
+                                err);
         }
         else if (method == "GET" && route == "/favicon.ico")
             send_str(fd, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", sh);

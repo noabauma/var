@@ -11,7 +11,7 @@ tournament scoreboard.
 | `slowmo_cam.cpp` | the recorder (C++, standalone; `slowmo_cam.py` = old reference) |
 | `score_function/` | PageRank score algorithms + `compute_scores.py` bridge |
 | `deploy/slowmo-cam.service` | systemd unit (source of the installed one) |
-| `set-web-password.sh` | change the web login password |
+| `set-web-password.sh` | change a web login password (`biliardino` or `admin`) |
 
 ## Running it (systemd)
 
@@ -42,8 +42,21 @@ https://<pi-ip>/        user: biliardino   password: ~/slowmo-cam-password.txt
 nginx terminates TLS on 443 (self-signed cert, accept the one-time warning;
 TLSv1.2 + ChaCha20 pinned — the Pi has no AES hardware, ChaCha is ~11×
 faster) and proxies to the recorder on `127.0.0.1:8081`. Old
-`http://…:8080` links redirect. Change the password with
-`./set-web-password.sh`. Over SSH, tunnel instead:
+`http://…:8080` links redirect. Change a password with
+`./set-web-password.sh [biliardino|admin]`.
+
+**Two logins:** `biliardino` is the shared everyone-account;
+**`admin`** (password: `~/slowmo-cam-admin-password.txt`) additionally
+gets clip **downloads**, the **PageRank algorithm switch** and the
+**damping-d slider**. nginx forwards the logged-in account as
+`X-Remote-User` (a client-sent header is overwritten, so it can't be
+spoofed); requests that never passed nginx — SSH tunnel, the TV's
+localhost browser — count as admin, because reaching `127.0.0.1:8081`
+means owning the Pi. Note: non-admins can still *watch* clips in the
+player, so a determined person could save the stream — the gate keeps
+the easy one-click download admin-only, it is not DRM.
+
+Over SSH, tunnel instead:
 `ssh -L 8081:localhost:8081 noabauma@<pi-ip>` → `http://localhost:8081`.
 **Prefer it open (no TLS/login)?** Set `--bind 0.0.0.0` in the service and
 browse `http://<pi-ip>:8081` — only do this if 443 isn't internet-exposed.
@@ -93,8 +106,9 @@ Rankings switchable between **bias PageRank**
 **classic PageRank** (`page_rank_biliardino_algorithm.py`). The Python files
 are the single source of truth — edit them and the board follows
 (`recursive_deletion` is deliberately not applied mid-tournament). The
-damping factor defaults to 0.85 and is settable via the API only
-(`POST /scores/d`, not persisted).
+bias/classic switch and the damping-d slider (default 0.85, not
+persisted) are visible to the `admin` login only; `POST /scores/d` is
+admin-gated server-side too.
 
 One big group; a match is **best of three** to 10; **each pair plays at most
 once**. Enter *team A*, *team B*, game scores from A's view

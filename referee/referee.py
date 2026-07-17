@@ -51,6 +51,9 @@ CFG_PATH = os.path.join(HERE, "referee.json")
 DEFAULT_CFG = {
     "base_url": "http://127.0.0.1:8081",
     "poll_fps": 2.0,
+    "idle_fps": 1.0,             # slower scan while no cards are on the table
+    "detect_downscale": 2,       # ArUco on a half-res copy: 3x cheaper, same
+                                 # detections (verified live); 1 = full res
     "aruco_dict": "DICT_4X4_50",
     "cards_map": "cards/mapping.json",  # marker id -> team name (gen_cards.py)
     "card_stable_s": 5.0,               # cards must sit this long to arm
@@ -123,13 +126,18 @@ def get_frame(base, cfg=None):
 
 # --------------------------------------------------------------- detection
 
-def detect_cards(img, dictionary):
-    """Returns {marker_id: (center_xy, corner_pts)} for every marker."""
-    corners, ids, _ = cv2.aruco.detectMarkers(img, dictionary)
+def detect_cards(img, dictionary, downscale=1):
+    """Returns {marker_id: (center_xy, corner_pts)} for every marker.
+    downscale > 1 detects on a shrunken copy (the markers are huge, the
+    detector cost is not) and scales the corners back to full-res coords."""
+    small = img if downscale == 1 else cv2.resize(
+        img, None, fx=1.0 / downscale, fy=1.0 / downscale,
+        interpolation=cv2.INTER_AREA)
+    corners, ids, _ = cv2.aruco.detectMarkers(small, dictionary)
     out = {}
     if ids is not None:
         for c, i in zip(corners, ids.flatten()):
-            pts = c[0]
+            pts = c[0] * downscale
             out[int(i)] = (tuple(pts.mean(axis=0)), pts)
     return out
 
@@ -326,7 +334,6 @@ def main_loop(cfg):
     else:
         print(f"warning: {mpath} missing — run gen_cards.py; markers will be ignored")
 
-    period = 1.0 / cfg["poll_fps"]
     state = "IDLE"
     teams = None            # (name_a, name_b) once armed
     cards_since = None
@@ -345,9 +352,11 @@ def main_loop(cfg):
             time.sleep(2)
             continue
 
-        detected = detect_cards(img, dictionary)
-        clean = mask_cards(img, detected)  # cards never pollute the rails
+        detected = detect_cards(img, dictionary,
+                                cfg.get("detect_downscale", 1))
         cards = {i: p for i, (p, _) in detected.items() if i in mapping}
+        if state != "IDLE" or cards:  # mask only when the rails get read
+            clean = mask_cards(img, detected)  # cards never pollute the rails
 
         if state == "IDLE":
             if len(cards) == 2:
@@ -453,6 +462,10 @@ def main_loop(cfg):
                                 note)
                         state = "DONE"
 
+        # empty table = nothing to react to: scan lazily, save the CPU
+        idle = state == "IDLE" and cards_since is None
+        period = 1.0 / (cfg.get("idle_fps", cfg["poll_fps"]) if idle
+                        else cfg["poll_fps"])
         dt = time.monotonic() - t0
         time.sleep(max(0.05, period - dt))
 

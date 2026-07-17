@@ -121,6 +121,29 @@ Endpoints: `GET /scores`, `POST /scores/add?a=X&b=Y&games=10-9,10-4`,
 Options: `--scores-file`, `--scores-script`, `--no-scores`. Needs
 `python3` + `numpy`.
 
+## Single-player mode (prototype, branch `single_player_mode`)
+
+Pickup 2v2 with **per-player** stats, fully separate from the team
+tournament (own log, own referee process — running it never touches
+`tournament.tsv`). Every player gets an ArUco card
+(`referee/gen_player_cards.py Alice Bob …`, ids 30+ so they can't collide
+with team cards). All four players lay their card in the corner of their
+position — defenders at their score rail (as in team mode), attackers at
+the free corner of their side — and `referee/referee_singles.py` arms an
+official match: live banner, bead-read scores, and on a finished
+best-of-three one line in `~/recordings/singles.tsv`
+(`A_def A_att B_def B_att games winner`). `python3 referee_singles.py
+watch` prints corner assignments without refereeing.
+
+`referee/singles_stats.py` turns the log into the fun numbers: per player
+matches / win% / **attacker share** ("Pat is 80% attacker") / win% per
+role / goal diff, **table side bias** (A vs B win rate with a p-value so
+noise isn't called bias), and two ratings: **2v2 team-average Elo**
+(K=32, start 1000; also split per role — top defender-Elo = *most
+valuable defender*) and **PageRank** over the accumulated player matrix
+(each match adds all four winner→loser edges), computed by the same
+`compute_scores.py` as the tournament. `--json` for machines.
+
 ## Terminal keys (when run interactively)
 
 `SPACE`/`s` save + instant replay · `r` replay again · any key stops a

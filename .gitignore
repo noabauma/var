@@ -8,3 +8,5 @@ referee/calibration*.jpg
 referee/referee.json
 referee/live_cards.jpg
 referee/masked_check.jpg
+speed/ref_bg.jpg
+speed/speed_cal.json

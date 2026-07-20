@@ -87,6 +87,17 @@ is wiped (nothing from before the press can be saved), `/save` is refused,
 and the video area shows "Camera is OFF". ON brings it back in ~2 s.
 Saved clips on disk are not affected. `POST /camera?on=0|1`.
 
+**⚽ Goal speed:** after each save is converted to MP4, `speed/ball_speed.py`
+replays the clip in the background (~40 s, nice'd): it finds the moving
+ball inside the calibrated playfield, and if the trajectory dies in a goal
+mouth without bouncing back out, the clip is a **goal** — the shot's speed
+lands in `<clip>.speed.json`, shows up green in the recordings list and
+pops up in the player at the goal moment. No goal, occluded view or a
+moved camera (background no longer matches `speed/ref_bg.jpg`, re-store it
+with `ball_speed.py calibrate <clip>`) = honest silence instead of a made-up
+number. Speeds assume a 1200×680 mm playfield (`table_mm` in
+`speed/speed_cal.json`) — tape-measure it once for exact numbers.
+
 **Slow link (VPN/weak WiFi)?** The full stream is ~24 Mbit/s. Pick a lower
 rate in the **fps selector** next to Live (remembered per browser); slow
 viewers also self-adapt server-side to fresh-not-stale frames.
@@ -162,6 +173,7 @@ replay · `q` quit.
 --scores-script PATH python bridge for the scoreboard
 --scores-file PATH   tournament state (default <out-dir>/tournament.tsv)
 --no-scores          disable the web scoreboard
+--speed-script PATH  goal/ball-speed analyzer ("" disables)
 ```
 
 ## Self-test & troubleshooting

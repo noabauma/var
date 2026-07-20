@@ -192,6 +192,7 @@ struct Cfg {
                                        // local reverse proxy / ssh tunnel
     int http_fps = 30;            // default live-stream rate served to browsers
     std::string scores_script = "~/src/var/score_function/compute_scores.py";
+    std::string speed_script = "~/src/var/speed/ball_speed.py"; // "" = off
     std::string scores_file;      // tournament state; default <out_dir>/tournament.tsv
     bool no_scores = false;       // disable the web scoreboard
 
@@ -262,6 +263,7 @@ static bool parse_args(int argc, char **argv, Cfg &cfg) {
         else if (a == "--bind") { if (!(v = need(i))) return false; cfg.http_bind = v; }
         else if (a == "--http-fps") { if (!(v = need(i))) return false; cfg.http_fps = atoi(v); }
         else if (a == "--scores-script") { if (!(v = need(i))) return false; cfg.scores_script = v; }
+        else if (a == "--speed-script") { if (!(v = need(i))) return false; cfg.speed_script = v; }
         else if (a == "--scores-file") { if (!(v = need(i))) return false; cfg.scores_file = v; }
         else if (a == "--no-scores") cfg.no_scores = true;
         else if (a == "--help" || a == "-h") { usage(argv[0]); exit(0); }
@@ -270,6 +272,7 @@ static bool parse_args(int argc, char **argv, Cfg &cfg) {
     cfg.out_dir = expand_home(cfg.out_dir);
     cfg.scores_script = expand_home(cfg.scores_script);
     cfg.scores_file = expand_home(cfg.scores_file);
+    cfg.speed_script = expand_home(cfg.speed_script);
     if (cfg.scores_file.empty()) cfg.scores_file = cfg.out_dir + "/tournament.tsv";
     if (cfg.width <= 0 || cfg.height <= 0 || cfg.capture_fps <= 0 ||
         cfg.playback_fps <= 0 || cfg.buffer_seconds <= 0) {
@@ -854,12 +857,35 @@ static bool safe_clip_name(const std::string &n) {
     return n.find("..") == std::string::npos;
 }
 
+// ball_speed.py leaves a "<clip>.speed.json" verdict next to each analyzed
+// clip (goal yes/no + shot speed); it travels with the clip through rename/
+// delete/prune and is embedded verbatim in the /recordings JSON.
+static std::string sidecar_of(const std::string &clip_path) {
+    size_t dot = clip_path.rfind('.');
+    if (dot == std::string::npos) return clip_path + ".speed.json";
+    return clip_path.substr(0, dot) + ".speed.json";
+}
+
+static std::string read_small_json(const std::string &path, size_t cap = 4096) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return "";
+    std::string s(cap, 0);
+    size_t n = std::fread(&s[0], 1, cap, f);
+    std::fclose(f);
+    s.resize(n);
+    // embedded verbatim into our own JSON: only accept a complete object
+    if (n == 0 || n == cap || s[0] != '{' || s[s.size() - 1] != '}')
+        return "";
+    return s;
+}
+
 struct ClipInfo {
     std::string name;
     uint32_t frames = 0, fps = 0;
     uint64_t bytes = 0;
     time_t mtime = 0;
     bool kept = false; // renamed -> out of prune_clips' reach
+    std::string speed; // raw <clip>.speed.json content ("" = not analyzed)
 };
 
 // Every *.avi in out_dir, newest first (for the web recordings panel).
@@ -887,6 +913,7 @@ static std::vector<ClipInfo> list_clips(const Cfg &cfg) {
             std::string err;
             if (r.open(full, err)) { ci.frames = r.frames; ci.fps = r.fps; }
         }
+        ci.speed = read_small_json(sidecar_of(full));
         out.push_back(std::move(ci));
     }
     closedir(d);
@@ -912,8 +939,10 @@ static void prune_clips(const Cfg &cfg, Shared *sh) {
     if ((int)clips.size() <= cfg.max_clips) return;
     std::sort(clips.begin(), clips.end());
     size_t doomed = clips.size() - (size_t)cfg.max_clips;
-    for (size_t i = 0; i < doomed; i++)
+    for (size_t i = 0; i < doomed; i++) {
         unlink((cfg.out_dir + "/" + clips[i]).c_str());
+        unlink(sidecar_of(cfg.out_dir + "/" + clips[i]).c_str());
+    }
     char msg[96];
     std::snprintf(msg, sizeof msg, "pruned %zu old clip%s (keeping newest %d)",
                   doomed, doomed == 1 ? "" : "s", cfg.max_clips);
@@ -931,8 +960,9 @@ struct Transcoder {
     std::condition_variable cv;
     std::deque<std::string> q;
     std::thread worker;
-    std::atomic<pid_t> cur{-1}; // in-flight ffmpeg, killed on shutdown
+    std::atomic<pid_t> cur{-1}; // in-flight ffmpeg/analyzer, killed on shutdown
     Shared *sh = nullptr;
+    std::string speed_script; // ball_speed.py, run after each conversion
 
     void enqueue(const std::string &avi_path) {
         {
@@ -971,7 +1001,14 @@ struct Transcoder {
                 src = q.front();
                 q.pop_front();
             }
-            if (access(src.c_str(), F_OK) != 0 || !has_ext(src, ".avi"))
+            if (access(src.c_str(), F_OK) != 0)
+                continue;
+            if (has_ext(src, ".mp4")) { // analyze-only (startup backfill)
+                if (access(sidecar_of(src).c_str(), F_OK) != 0)
+                    analyze_speed(src);
+                continue;
+            }
+            if (!has_ext(src, ".avi"))
                 continue;
             std::string dst = src.substr(0, src.size() - 4) + ".mp4";
             if (access(dst.c_str(), F_OK) == 0) continue; // already converted
@@ -994,14 +1031,45 @@ struct Transcoder {
                 unlink(src.c_str());
                 std::snprintf(msg, sizeof msg, "converted %s (%.1f MB)",
                               basename_of(dst).c_str(), pst.st_size / 1e6);
-            } else {
-                unlink(part.c_str());
-                std::snprintf(msg, sizeof msg,
-                              "transcode failed for %s — keeping the AVI",
-                              basename_of(src).c_str());
+                sh->msgs.push(msg);
+                analyze_speed(dst);
+                continue;
             }
+            unlink(part.c_str());
+            std::snprintf(msg, sizeof msg,
+                          "transcode failed for %s — keeping the AVI",
+                          basename_of(src).c_str());
             sh->msgs.push(msg);
         }
+    }
+
+    // Was that a goal, and how fast? Runs ball_speed.py on the finished MP4
+    // (~40s at nice 19, serialized on this worker) which writes the
+    // <clip>.speed.json sidecar the web player reads.
+    void analyze_speed(const std::string &mp4) {
+        if (speed_script.empty()) return;
+        Child a = spawn({"nice", "-n", "19", "python3", speed_script,
+                         "analyze", mp4},
+                        false, true);
+        if (a.pid < 0) return;
+        cur = a.pid;
+        int st = 0;
+        waitpid(a.pid, &st, 0);
+        cur = -1;
+        if (!sh->alive) return;
+        std::string sc = read_small_json(sidecar_of(mp4));
+        char msg[192];
+        if (sc.find("\"goal\": true") != std::string::npos) {
+            double kmh = 0;
+            size_t p = sc.find("\"speed_kmh\":");
+            if (p != std::string::npos) kmh = atof(sc.c_str() + p + 12);
+            std::snprintf(msg, sizeof msg, "GOAL in %s — shot at %.1f km/h",
+                          basename_of(mp4).c_str(), kmh);
+        } else {
+            std::snprintf(msg, sizeof msg, "%s: no goal detected",
+                          basename_of(mp4).c_str());
+        }
+        sh->msgs.push(msg);
     }
 };
 
@@ -2309,6 +2377,9 @@ main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10p
 #privacy{position:absolute;inset:0;background:#0b0e12;border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:26px;font-weight:700;color:#8b96a5}
 #privacy[hidden]{display:none}
 #livematch{position:absolute;left:50%;transform:translateX(-50%);bottom:12px;background:rgba(11,14,18,.82);border:1px solid #1c2530;border-radius:10px;padding:8px 18px;font-size:16px;font-weight:700;color:#fff;white-space:nowrap}
+#goalspeed{position:absolute;left:50%;transform:translateX(-50%);top:12px;background:rgba(11,14,18,.85);border:1px solid #22c55e;border-radius:10px;padding:8px 20px;font-size:22px;font-weight:700;color:#22c55e;white-space:nowrap;animation:p 1s 3}
+#goalspeed[hidden]{display:none}
+.rspeed{color:#22c55e;font-weight:700}
 #livematch small{font-weight:400;color:#8b96a5;margin-left:10px}
 #livematch[hidden]{display:none}
 #privacy span{font-size:14px;font-weight:400;color:#5c6672}
@@ -2438,7 +2509,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 </aside>
-<div id="wrap"><img id="cam" src="/stream" alt="live"><video id="vid" controls playsinline hidden></video><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="livematch" hidden></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
+<div id="wrap"><img id="cam" src="/stream" alt="live"><video id="vid" controls playsinline hidden></video><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="livematch" hidden></div><div id="goalspeed" hidden></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
 </main>
 <footer>
 <button id="save">&#128308; Save + replay</button>
@@ -2527,6 +2598,7 @@ const $=id=>document.getElementById(id),cam=$('cam'),badge=$('badge'),st=$('st')
 let timer=0,replayFrames=0,playFps=30,slow=4,recs=[],playingRec=null;
 function live(){clearTimeout(timer);badge.hidden=true;playingRec=null;renderRecs();
   const v=$('vid');if(!v.hidden){v.pause();v.removeAttribute('src');v.load();v.hidden=true;}
+  $('goalspeed').hidden=true;v.ontimeupdate=null;
   cam.hidden=false;
   const r=localStorage.getItem('streamfps')||'';
   cam.src='/stream?'+(r?'fps='+r+'&':'')+'t='+Date.now();}
@@ -2534,8 +2606,15 @@ function replay(sec){clearTimeout(timer);badge.textContent='REPLAY '+slow+'× SL
   cam.src='/replay?t='+Date.now();if(sec>0)timer=setTimeout(live,sec*1000+400);}
 function replayRec(name,sec){clearTimeout(timer);playingRec=name;renderRecs();
   badge.textContent='REPLAY '+name.replace(/\.(avi|mp4)$/,'');badge.hidden=false;
+  const gs=$('goalspeed');gs.hidden=true;
   if(name.endsWith('.mp4')){ // native player: pause/scrub, exits via Live
    cam.hidden=true;const v=$('vid');v.hidden=false;
+   const f=recs.find(r=>r.name===name);
+   if(f&&f.speed&&f.speed.goal){ // reveal the shot speed at the goal moment
+    gs.textContent='⚽ '+f.speed.speed_kmh+' km/h  ('+f.speed.speed_ms+' m/s)';
+    const at=Math.max(0,(f.speed.goal_frame||0)/playFps-0.2);
+    v.ontimeupdate=()=>{gs.hidden=v.currentTime<at;};
+   }else v.ontimeupdate=null;
    v.src='/recordings/file?file='+encodeURIComponent(name);v.play();return;}
   cam.src='/replay?file='+encodeURIComponent(name)+'&t='+Date.now();
   if(sec>0)timer=setTimeout(live,sec*1000+400);}
@@ -2612,6 +2691,9 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
   const meta=document.createElement('div');meta.className='meta';
   meta.textContent=(f.fps>0?(f.frames/f.fps).toFixed(1)+' s · ':'')
    +(f.bytes/1e6).toFixed(1)+' MB · '+fmtWhen(f.mtime);
+  if(f.speed&&f.speed.goal){const sp=document.createElement('span');
+   sp.className='rspeed';sp.textContent=' · ⚽ '+f.speed.speed_kmh+' km/h';
+   sp.title='shot speed (auto-measured from the replay)';meta.appendChild(sp);}
   it.appendChild(nm);it.appendChild(meta);
   it.onclick=()=>replayRec(f.name,f.fps>0?f.frames/f.fps:0);
   rl.appendChild(it);});}
@@ -3328,10 +3410,15 @@ static void handle_recordings(int fd, const Cfg &cfg, Shared *sh) {
         json_escape(j, c.name);
         std::snprintf(buf, sizeof buf,
                       "\",\"frames\":%u,\"fps\":%u,\"bytes\":%llu,"
-                      "\"mtime\":%lld,\"kept\":%s}",
+                      "\"mtime\":%lld,\"kept\":%s",
                       c.frames, c.fps, (unsigned long long)c.bytes,
                       (long long)c.mtime, c.kept ? "true" : "false");
         j += buf;
+        if (!c.speed.empty()) { // verbatim ball_speed.py sidecar
+            j += ",\"speed\":";
+            j += c.speed;
+        }
+        j += '}';
     }
     send_simple(fd, sh, "200 OK", "application/json", j + "]}");
 }
@@ -3369,6 +3456,8 @@ static void handle_recording_rename(int fd, const Cfg &cfg, Shared *sh,
         scores_error(fd, sh, "400 Bad Request", err);
         return;
     }
+    rename(sidecar_of(cfg.out_dir + "/" + oldn).c_str(),  // speed verdict
+           sidecar_of(cfg.out_dir + "/" + newn).c_str()); // travels along
     if (basename_of(sh->get_last_path()) == oldn)
         sh->set_last_path(cfg.out_dir + "/" + newn);
     sh->msgs.push("renamed " + oldn + " -> " + newn + " (kept forever)");
@@ -3453,6 +3542,7 @@ static void handle_recording_delete(int fd, const Cfg &cfg, Shared *sh,
         scores_error(fd, sh, "400 Bad Request", err);
         return;
     }
+    unlink(sidecar_of(cfg.out_dir + "/" + fname).c_str());
     sh->msgs.push("deleted " + fname);
     send_simple(fd, sh, "200 OK", "application/json", "{\"ok\":true}");
 }
@@ -3940,12 +4030,23 @@ int main(int argc, char **argv) {
     Shared sh(cfg.max_frames(), (size_t)cfg.capture_fps);
     if (cfg.selftest == 0 && has_cmd("ffmpeg")) {
         sh.xcode = &xcode;
+        if (!cfg.speed_script.empty() &&
+            access(cfg.speed_script.c_str(), F_OK) == 0)
+            xcode.speed_script = cfg.speed_script;
+        else if (!cfg.speed_script.empty())
+            std::fprintf(stderr, "warning: speed script not found (%s) — "
+                                 "goal-speed analysis off (--speed-script)\n",
+                         cfg.speed_script.c_str());
         xcode.start(&sh);
-        // self-migration: convert clips that are still AVI (older saves,
-        // or a conversion that was interrupted by a shutdown)
-        for (const auto &ci : list_clips(cfg))
+        // self-migration: convert clips that are still AVI (older saves, or
+        // a conversion that was interrupted by a shutdown), and analyze any
+        // MP4 whose speed verdict is missing (analysis interrupted)
+        for (const auto &ci : list_clips(cfg)) {
             if (has_ext(ci.name, ".avi"))
                 xcode.enqueue(cfg.out_dir + "/" + ci.name);
+            else if (!xcode.speed_script.empty() && ci.speed.empty())
+                xcode.enqueue(cfg.out_dir + "/" + ci.name);
+        }
     }
     if (!cfg.no_scores && cfg.http_port > 0 && cfg.selftest == 0) {
         if (access(cfg.scores_script.c_str(), F_OK) != 0) {

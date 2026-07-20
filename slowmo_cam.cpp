@@ -2380,6 +2380,7 @@ main{flex:1;display:flex;align-items:center;justify-content:center;padding:0 10p
 #goalspeed{position:absolute;left:50%;transform:translateX(-50%);top:12px;background:rgba(11,14,18,.85);border:1px solid #22c55e;border-radius:10px;padding:8px 20px;font-size:22px;font-weight:700;color:#22c55e;white-space:nowrap;animation:p 1s 3}
 #goalspeed[hidden]{display:none}
 .rspeed{color:#22c55e;font-weight:700}
+.rit .nm .rspeed{flex:0 0 auto;font-size:12px;white-space:nowrap}
 #livematch small{font-weight:400;color:#8b96a5;margin-left:10px}
 #livematch[hidden]{display:none}
 #privacy span{font-size:14px;font-weight:400;color:#5c6672}
@@ -2664,6 +2665,9 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
    k.title='renamed — never auto-pruned';nm.appendChild(k);}
   const s=document.createElement('span');s.textContent=f.name.replace(/\.(avi|mp4)$/,'');
   nm.appendChild(s);
+  if(f.speed&&f.speed.goal){const sp=document.createElement('span');
+   sp.className='rspeed';sp.textContent='⚽ '+f.speed.speed_kmh+' km/h';
+   sp.title='shot speed (auto-measured from the replay)';nm.appendChild(sp);}
   const rb=document.createElement('button');rb.textContent='✎';rb.className='mbtn';
   rb.title='rename (renamed clips are kept forever)';
   rb.onclick=async ev=>{ev.stopPropagation();
@@ -2691,9 +2695,6 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
   const meta=document.createElement('div');meta.className='meta';
   meta.textContent=(f.fps>0?(f.frames/f.fps).toFixed(1)+' s · ':'')
    +(f.bytes/1e6).toFixed(1)+' MB · '+fmtWhen(f.mtime);
-  if(f.speed&&f.speed.goal){const sp=document.createElement('span');
-   sp.className='rspeed';sp.textContent=' · ⚽ '+f.speed.speed_kmh+' km/h';
-   sp.title='shot speed (auto-measured from the replay)';meta.appendChild(sp);}
   it.appendChild(nm);it.appendChild(meta);
   it.onclick=()=>replayRec(f.name,f.fps>0?f.frames/f.fps:0);
   rl.appendChild(it);});}

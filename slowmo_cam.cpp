@@ -2678,12 +2678,11 @@ function renderRecs(){const rl=$('rlist');rl.innerHTML='';
     +'&name='+encodeURIComponent(nv.trim()),{method:'POST'})).json();
     if(!r.ok)alert(r.error);else{if(playingRec===f.name)playingRec=null;recsPoll();}}catch(e){}};
   nm.appendChild(rb);
-  if(isAdmin){ // server refuses non-admin downloads anyway; don't tease
-   const dl=document.createElement('button');dl.textContent='⬇';dl.className='mbtn';
-   dl.title='download this clip (admin)';
-   dl.onclick=ev=>{ev.stopPropagation();
-    location.href='/recordings/download?file='+encodeURIComponent(f.name);};
-   nm.appendChild(dl);}
+  const dl=document.createElement('button');dl.textContent='⬇';dl.className='mbtn';
+  dl.title='download this clip';
+  dl.onclick=ev=>{ev.stopPropagation();
+   location.href='/recordings/download?file='+encodeURIComponent(f.name);};
+  nm.appendChild(dl);
   const db=document.createElement('button');db.textContent='🗑';db.className='mbtn';
   db.title='delete this clip (permanent)';
   db.onclick=async ev=>{ev.stopPropagation();
@@ -3580,13 +3579,8 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_save(fd, cfg, sh);
         else if (method == "GET" && route == "/recordings")
             handle_recordings(fd, cfg, sh);
-        else if (method == "GET" && route == "/recordings/download") {
-            if (!admin)
-                send_simple(fd, sh, "403 Forbidden", "application/json",
-                            "{\"ok\":false,\"error\":\"downloads are admin-only\"}");
-            else
-                serve_clip_file(fd, cfg, sh, path, "", true);
-        }
+        else if (method == "GET" && route == "/recordings/download")
+            serve_clip_file(fd, cfg, sh, path, "", true);
         else if (method == "GET" && route == "/recordings/file")
             serve_clip_file(fd, cfg, sh, path, range_hdr, false);
         else if (method == "POST" && route == "/recordings/rename")

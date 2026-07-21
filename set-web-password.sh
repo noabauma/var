@@ -2,8 +2,8 @@
 # Change a slowmo-cam web login:  ./set-web-password.sh [biliardino|admin]
 #
 # 'biliardino' (default) is the shared everyone-login; 'admin' additionally
-# unlocks clip downloads, the PageRank algorithm switch and the damping
-# slider. The password the browser checks is the HASH in
+# unlocks the PageRank algorithm switch and the damping slider. The
+# password the browser checks is the HASH in
 # /etc/nginx/slowmo.htpasswd — the ~/slowmo-cam*-password.txt files are only
 # plain-text notes for the humans. This script updates one user's line
 # (keeping the other) and reloads nginx, so the new password works instantly.

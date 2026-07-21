@@ -47,14 +47,11 @@ faster) and proxies to the recorder on `127.0.0.1:8081`. Old
 
 **Two logins:** `biliardino` is the shared everyone-account;
 **`admin`** (password: `~/slowmo-cam-admin-password.txt`) additionally
-gets clip **downloads**, the **PageRank algorithm switch** and the
-**damping-d slider**. nginx forwards the logged-in account as
-`X-Remote-User` (a client-sent header is overwritten, so it can't be
-spoofed); requests that never passed nginx — SSH tunnel, the TV's
-localhost browser — count as admin, because reaching `127.0.0.1:8081`
-means owning the Pi. Note: non-admins can still *watch* clips in the
-player, so a determined person could save the stream — the gate keeps
-the easy one-click download admin-only, it is not DRM.
+gets the **PageRank algorithm switch** and the **damping-d slider**.
+nginx forwards the logged-in account as `X-Remote-User` (a client-sent
+header is overwritten, so it can't be spoofed); requests that never
+passed nginx — SSH tunnel, the TV's localhost browser — count as admin,
+because reaching `127.0.0.1:8081` means owning the Pi.
 
 Over SSH, tunnel instead:
 `ssh -L 8081:localhost:8081 noabauma@<pi-ip>` → `http://localhost:8081`.

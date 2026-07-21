@@ -14,7 +14,7 @@ User=noabauma
 # thread must never wait for a browser tab
 Nice=-10
 WorkingDirectory=/home/noabauma/src/var
-ExecStart=/home/noabauma/src/var/slowmo_cam --bind 127.0.0.1 --port 8081
+ExecStart=/home/noabauma/src/var/slowmo_cam --bind 127.0.0.1 --port 8081 --seconds 8
 Restart=always
 RestartSec=5
 

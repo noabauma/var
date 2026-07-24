@@ -62,19 +62,18 @@ DEFAULT_CFG = {
     "games_to_win": 2,                  # best of three
     "auto_open_betting": False,  # side effect on the real board — off while testing
     "auto_enter": False,         # testing phase: log results, never write them
-    # measured on the rotated table, 2026-07-15 (mono 1280x720).
-    # The boxes are generous search windows (the table shifts a little
-    # during play) — the bead band is located inside them every frame.
-    # Each rail carries 12 beads of which the outermost one at each end
-    # is decoration (deco_ends): the scoring-end group is reduced by one.
-    # The table rotation makes rail A read point-symmetrically to B:
-    # A scores toward high y, B toward low y.
-    "beads_a": {"x": 195, "y": 260, "w": 105, "h": 270, "axis": "y",
-                "score_end": "high", "thresh": 80, "total_beads": 12,
-                "band_px": 36, "rail_px": 295, "pitch_px": 15.5, "deco_ends": True},
-    "beads_b": {"x": 1030, "y": 230, "w": 110, "h": 285, "axis": "y",
-                "score_end": "high", "thresh": 95, "total_beads": 12,
-                "band_px": 36, "rail_px": 295, "pitch_px": 15, "deco_ends": True},
+    # Garlando table, color cam at 720p (calibrated 2026-07-24). Each
+    # score slider carries 10 beads (5 colored + 3 grey + 2 white) on a
+    # BLACK rod between a black handle and end cap, mounted at the short
+    # ends: "rod" mode counts via the exposed-rod gap (dark AND colorless
+    # pixels), so bead colors — even white-on-white — never matter.
+    # beads_a = left/red slider, beads_b = right/blue slider.
+    "beads_a": {"x": 78, "y": 215, "w": 52, "h": 305, "axis": "y",
+                "rod": True, "rod_span": [67, 262], "score_end": "high",
+                "total_beads": 10, "pitch_px": 17.8},
+    "beads_b": {"x": 1146, "y": 235, "w": 56, "h": 290, "axis": "y",
+                "rod": True, "rod_span": [27, 250], "score_end": "high",
+                "total_beads": 10, "pitch_px": 19.0},
     "row_frac": 0.25,                   # band row counts as "bead" above this
     "occlusion_frac": 0.6,              # band covered more than this = hand
 }
@@ -101,11 +100,10 @@ _cap = None
 
 
 def get_frame(base, cfg=None):
-    """Frame source. Default: the recorder's /frame (shares the VAR camera).
-    Set "video_source": "/dev/videoN" in referee.json to give the referee
-    its OWN camera (e.g. the FullHD color cam) while the OV9281 keeps doing
-    120fps slow-mo — two devices, no conflict. Color frames are converted
-    to grayscale for now; hue-based bead segmentation can hook in here."""
+    """Frame source, in COLOR (BGR) since the AR0234 — the Garlando bead
+    reading needs it. Default: the recorder's /frame (shares the VAR
+    camera). Set "video_source": "/dev/videoN" in referee.json to give
+    the referee its own second camera instead."""
     global _cap
     src = (cfg or {}).get("video_source", "")
     if src.startswith("/dev/"):
@@ -118,9 +116,9 @@ def get_frame(base, cfg=None):
             _cap.release()
             _cap = None
             raise RuntimeError(f"cannot read {src}")
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return frame
     data = http(base, "/frame")
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     return img
 
 
@@ -163,8 +161,71 @@ def mask_cards(img, detected):
     return out
 
 
+def count_beads_rod(img, roi, cfg):
+    """Garlando score slider: total_beads beads slide on a BLACK rod
+    between a black handle and a black end cap. Wherever no bead sits,
+    the exposed rod shows as a run of dark AND colorless pixels — dark
+    alone would confuse the navy beads, brightness alone the white ones.
+    The dark runs at the strip's extremes are the handle/end cap; runs
+    between them are exposed rod. Score = beads on the scoring side of
+    the widest exposed-rod gap; a single jammed block means 0 or
+    total_beads, told apart by which end holds the slack.
+    Needs a COLOR (BGR) image. Returns (score, occluded)."""
+    x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
+    strip = img[y:y + h, x:x + w]
+    if strip.size == 0:
+        return 0, True
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+    if roi["axis"] == "x":
+        hsv = hsv.transpose(1, 0, 2)
+    # a row shows exposed rod iff its dark-AND-colorless pixels form ONE
+    # narrow cluster (the rod seen end-on). Beads COVER the rod and their
+    # lit tops are bright or colored; their shading sits at the strip
+    # edges as wide/split dark spans, which this rejects — and unlike a
+    # fixed centre column it tolerates a slightly tilted slider.
+    dark = (hsv[:, :, 2] < roi.get("rod_v", 85)) & \
+           (hsv[:, :, 1] < roi.get("rod_s", 90))
+    on = np.zeros(dark.shape[0], bool)
+    for i in range(dark.shape[0]):
+        cols = np.flatnonzero(dark[i])
+        on[i] = 2 <= len(cols) <= 14 and cols[-1] - cols[0] <= 14
+    total = roi.get("total_beads", 10)
+    pitch = roi.get("pitch_px", 19.0)
+    # bead-travel zone (knob edge .. cap edge), strip-relative: calibrated
+    # once — the slider is bolted to the table, unlike the beads
+    lo, hi = roi["rod_span"]
+    zone = on[lo:hi]
+    runs = []
+    start = None
+    for i, v in enumerate(zone):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append((start, i - start))
+            start = None
+    if start is not None:
+        runs.append((start, len(zone) - start))
+    # a real gap is at least half a bead wide; smaller dark runs are bead
+    # shadows/gloss and stay part of the bead mass
+    gaps = [r for r in runs if r[1] >= 0.5 * pitch]
+    bead_px = (hi - lo) - sum(l for _, l in gaps)
+    if abs(bead_px / pitch - total) > 1.5:
+        return 0, True  # beads unaccounted for: hand/glare over the slider
+    if not gaps:
+        return 0, False  # all beads in one block = freshly reset: 0
+    se = roi.get("_score_end", roi["score_end"])
+    gi = max(range(len(gaps)), key=lambda i: gaps[i][1])
+    split = gaps[gi][0]
+    low_px = split - sum(l for s, l in gaps if s < split)
+    seg = low_px if se == "low" else bead_px - low_px
+    return max(0, min(total, int(round(seg / pitch)))), False
+
+
 def count_beads(img, roi, cfg):
-    """Counts beads on the scoring side of the rail ROI.
+    """Counts beads on the scoring side of the rail ROI. Dispatches to
+    count_beads_rod for "rod": true ROIs (the Garlando sliders, color);
+    the legacy path below reads bright beads on a dark rail from a
+    grayscale image (the old Gubler end panels).
 
     Touching beads merge into one blob, so blobs are useless — instead the
     bright mask is projected onto the rail axis into bead/no-bead runs.
@@ -173,10 +234,14 @@ def count_beads(img, roi, cfg):
     side of the largest gap, divided by the pitch, is the score.
     Returns (score, occluded).
     """
+    if roi.get("rod"):
+        return count_beads_rod(img, roi, cfg)
     x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
     crop = img[y:y + h, x:x + w]
     if crop.size == 0:
         return 0, True
+    if crop.ndim == 3:
+        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     # per-frame Otsu threshold: the camera's auto-exposure shifts constantly
     # with people moving, so a fixed threshold goes stale within minutes.
     # roi["thresh"] acts as a floor so a beadless dark strip can't split.

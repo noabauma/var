@@ -42,12 +42,14 @@ CAL_PATH = os.path.join(HERE, "speed_cal.json")
 REF_BG = os.path.join(HERE, "ref_bg.jpg")
 
 DEFAULT_CAL = {
-    # playfield corners TL,TR,BR,BL in the reference image (calibrated on
-    # the 2026-07-20 camera pose via warped-marking symmetry)
-    "quad": [[290, 205], [930, 185], [945, 580], [277, 603]],
-    "table_mm": [1200, 680],   # playfield length x width, inner walls
+    # Garlando table / AR0234 color cam at 720p (2026-07-24): playfield
+    # corners TL,TR,BR,BL from the green-field segmentation, dimensions
+    # derived from the 205mm centre circle (tape-measure to confirm)
+    "quad": [[224, 124], [1082, 143], [1072, 585], [214, 565]],
+    "table_mm": [1190, 635],   # playfield length x width, inner walls
     "goal_half_mm": 115,       # goal mouth half-width + margin
-    "capture_fps": 120.0,
+    "capture_fps": 97.0,       # measured; light-dependent — remeasure with
+                               # the lamp (the camera paces on exposure)
     "min_ecc": 0.5,            # weaker background match = camera moved
     "diff_thresh": 35,         # background-difference threshold
     "ball_bright": 110,        # the ball is white: min pixel brightness

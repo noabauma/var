@@ -963,13 +963,24 @@ struct Transcoder {
     std::atomic<pid_t> cur{-1}; // in-flight ffmpeg/analyzer, killed on shutdown
     Shared *sh = nullptr;
     std::string speed_script; // ball_speed.py, run after each conversion
+    double last_enqueue = 0;  // guarded by m
 
     void enqueue(const std::string &avi_path) {
         {
             std::lock_guard<std::mutex> lk(m);
             q.push_back(avi_path);
+            last_enqueue = now_mono();
         }
         cv.notify_one();
+    }
+
+    // People save a clip to WATCH it right away — heavy background disk
+    // work (the color clips are ~170MB) must never fight that. Hold work
+    // while a save is writing and for a grace minute after the newest
+    // save, unless a backlog piles up.
+    bool clear_to_work() {
+        if (sh->save_busy) return false;
+        return now_mono() - last_enqueue > 60.0 || q.size() > 2;
     }
 
     void start(Shared *s) {
@@ -997,7 +1008,7 @@ struct Transcoder {
                     return !q.empty() || !sh->alive;
                 });
                 if (!sh->alive) return;
-                if (q.empty()) continue;
+                if (q.empty() || !clear_to_work()) continue;
                 src = q.front();
                 q.pop_front();
             }
@@ -1013,7 +1024,9 @@ struct Transcoder {
             std::string dst = src.substr(0, src.size() - 4) + ".mp4";
             if (access(dst.c_str(), F_OK) == 0) continue; // already converted
             std::string part = dst + ".part.mp4";
-            Child c = spawn({"nice", "-n", "10", "ffmpeg", "-y", "-v", "error",
+            // idle IO class: the SD card goes to live saves/replays first
+            Child c = spawn({"ionice", "-c", "3", "nice", "-n", "10",
+                             "ffmpeg", "-y", "-v", "error",
                              "-i", src, "-c:v", "h264_v4l2m2m", "-b:v", "4M",
                              "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                              part},
@@ -1048,8 +1061,8 @@ struct Transcoder {
     // <clip>.speed.json sidecar the web player reads.
     void analyze_speed(const std::string &mp4) {
         if (speed_script.empty()) return;
-        Child a = spawn({"nice", "-n", "19", "python3", speed_script,
-                         "analyze", mp4},
+        Child a = spawn({"ionice", "-c", "3", "nice", "-n", "19", "python3",
+                         speed_script, "analyze", mp4},
                         false, true);
         if (a.pid < 0) return;
         cur = a.pid;

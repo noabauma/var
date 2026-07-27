@@ -21,8 +21,8 @@ WorkingDirectory=/home/noabauma/src/var
 # are broken in this bridge's firmware: exposure stays auto (paces
 # ~97 fps at 720p in daylight, true 120 needs ~25% more light (lamp) —
 # not a promise), focus is the physical lens ring.
-ExecStartPre=-/usr/bin/v4l2-ctl -d /dev/v4l/by-id/usb-DCXIN_DCXIN_Camera_01.00.000-video-index0 --set-ctrl auto_exposure=3 --set-ctrl exposure_dynamic_framerate=0 --set-ctrl gain=24 --set-ctrl sharpness=800 --set-ctrl brightness=128 --set-ctrl white_balance_automatic=1 --set-ctrl power_line_frequency=0 --set-ctrl focus_automatic_continuous=0
-ExecStart=/home/noabauma/src/var/slowmo_cam --bind 127.0.0.1 --port 8081 --seconds 8 --device /dev/v4l/by-id/usb-DCXIN_DCXIN_Camera_01.00.000-video-index0 --width 1280 --height 720 --fps 120
+ExecStartPre=-/usr/bin/v4l2-ctl -d /dev/v4l/by-id/usb-DCXIN_DCXIN_Camera_01.00.000-video-index0 --set-ctrl auto_exposure=3 --set-ctrl exposure_dynamic_framerate=0 --set-ctrl gain=24 --set-ctrl sharpness=500 --set-ctrl brightness=128 --set-ctrl white_balance_automatic=1 --set-ctrl power_line_frequency=0 --set-ctrl focus_automatic_continuous=0
+ExecStart=/home/noabauma/src/var/slowmo_cam --bind 127.0.0.1 --port 8081 --seconds 5 --device /dev/v4l/by-id/usb-DCXIN_DCXIN_Camera_01.00.000-video-index0 --width 1280 --height 720 --fps 120
 Restart=always
 RestartSec=5
 

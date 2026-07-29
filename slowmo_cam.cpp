@@ -2532,7 +2532,7 @@ button:disabled{opacity:.4;cursor:default}
 #h2hwide{width:calc(100vw - 28px);max-width:1600px;position:relative;left:50%;transform:translateX(-50%)}
 #h2h{display:flex;gap:24px;align-items:center;justify-content:center;flex-wrap:wrap}
 #vswrap{overflow-x:auto;flex:0 1 auto;min-width:0}
-#gwrap{flex:0 1 520px;min-width:320px;max-width:560px}
+#gwrap{flex:1 1 640px;min-width:360px;max-width:920px}
 #gwrap svg{width:100%;height:auto;display:block;overflow:visible}
 #gcap{color:#5c6672;font-size:12px;margin-top:4px}
 #rhblock{margin-top:20px}
@@ -2903,7 +2903,16 @@ function renderVs(idx){const wrap=$('vswrap');wrap.innerHTML='';
 function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
  svg.textContent='';
  if(!S||!idx.length)return;
- const n=idx.length,cx=280,cy=200,R=n>1?128:0,NR=5;
+ // size the drawing to its panel, capped at the matrix table's height so
+ // the two stay level; the ring radius uses everything that's left after
+ // the outward node labels (wide east/west, shallow north/south)
+ const wpx=$('gwrap').clientWidth||560,
+       mh=$('vswrap').offsetHeight,hpx=mh>300?mh:460;
+ svg.style.height=hpx+'px';
+ const VW=Math.max(560,Math.round(wpx)),VH=Math.max(380,Math.round(VW*hpx/wpx));
+ svg.setAttribute('viewBox','0 0 '+VW+' '+VH);
+ const n=idx.length,cx=VW/2,cy=VH/2,
+       R=n>1?Math.max(120,Math.min(VW/2-165,VH/2-28)):0,NR=6;
  const pos={};
  idx.forEach((ti,k)=>{const a=-Math.PI/2+2*Math.PI*k/n;
   pos[ti]=[cx+R*Math.cos(a),cy+R*Math.sin(a),a];});

@@ -5,9 +5,13 @@ Reads a win matrix on stdin, prints two lines of scores on stdout:
 
     usage:  compute_scores.py [d]   (PageRank damping factor, default 0.85)
     input:  N  followed by N*N matrix entries (whitespace-separated),
-            where M[i][j] = 1 if team i won the (single) match vs team j
+            where M[i][j] = 1 if team i won the (single) match vs team j;
+            optionally followed by a second N*N matrix whose entries are
+            the goal-difference weights ("weighted bias":
+            x*|totals_w - totals_l| / (games*10), built by the caller)
     output: line 1 — bias PageRank  (page_rank_biliardino_algorithm_bias)
             line 2 — classic PageRank (page_rank_biliardino_algorithm)
+            line 3 — bias PageRank on the weighted matrix (if provided)
 
 Both algorithm files stay the single source of truth — edit them and the
 live scoreboard follows. recursive_deletion() is intentionally NOT applied:
@@ -59,24 +63,37 @@ def main():
         # minus without it, and the same for the loser — i.e. how many
         # points the win adds and the loss costs vs a tournament in which
         # that match was never played.
+        # input: L S n, binary n*n matrix, weighted n*n matrix, then S
+        # triples "winner loser weight". Output per match: 6 numbers —
+        # bias dw dl, classic dw dl, weighted-bias dw dl.
         S, n = int(data[1]), int(data[2])
-        vals = [float(x) for x in data[3:3 + n * n]]
-        pairs = [int(x) for x in data[3 + n * n:3 + n * n + 2 * S]]
-        if len(vals) != n * n or len(pairs) != 2 * S:
+        o = 3
+        vals = [float(x) for x in data[o:o + n * n]]
+        wvals = [float(x) for x in data[o + n * n:o + 2 * n * n]]
+        trip = [float(x) for x in data[o + 2 * n * n:o + 2 * n * n + 3 * S]]
+        if len(vals) != n * n or len(wvals) != n * n or len(trip) != 3 * S:
             sys.exit("leave-one-out data incomplete")
         M = np.array(vals, dtype=np.float64).reshape(n, n)
+        W = np.array(wvals, dtype=np.float64).reshape(n, n)
         lines = []
         with contextlib.redirect_stdout(io.StringIO()):
             base_b = pagerank_bias(M.copy(), d, participation_bias=True)
             base_p = pagerank_plain(M.copy(), d)
+            base_w = pagerank_bias(W.copy(), d, participation_bias=True)
             for k in range(S):
-                w, l = pairs[2 * k], pairs[2 * k + 1]
+                w, l = int(trip[3 * k]), int(trip[3 * k + 1])
+                wt = trip[3 * k + 2]
                 M2 = M.copy()
                 M2[w][l] -= 1.0
+                W2 = W.copy()
+                W2[w][l] -= wt
                 vb = pagerank_bias(M2.copy(), d, participation_bias=True)
                 vp = pagerank_plain(M2, d)
-                lines.append(f"{base_b[w] - vb[w]:.10f} {base_b[l] - vb[l]:.10f} "
-                             f"{base_p[w] - vp[w]:.10f} {base_p[l] - vp[l]:.10f}")
+                vw = pagerank_bias(W2, d, participation_bias=True)
+                lines.append(
+                    f"{base_b[w] - vb[w]:.10f} {base_b[l] - vb[l]:.10f} "
+                    f"{base_p[w] - vp[w]:.10f} {base_p[l] - vp[l]:.10f} "
+                    f"{base_w[w] - vw[w]:.10f} {base_w[l] - vw[l]:.10f}")
         print("\n".join(lines))
         return
     n = int(data[0])
@@ -87,13 +104,20 @@ def main():
     vals = [float(x) for x in data[1:1 + n * n]]
     if len(vals) != n * n:
         sys.exit("matrix data incomplete")
+    wvals = [float(x) for x in data[1 + n * n:1 + 2 * n * n]]
     M = np.array(vals, dtype=np.float64).reshape(n, n)
     # the classic pagerank() print()s its matrix — keep stdout clean
     with contextlib.redirect_stdout(io.StringIO()):
         vb = pagerank_bias(M.copy(), d, participation_bias=True)
         vp = pagerank_plain(M.copy(), d)
+        vw = None
+        if len(wvals) == n * n:  # optional goal-difference-weighted matrix
+            W = np.array(wvals, dtype=np.float64).reshape(n, n)
+            vw = pagerank_bias(W, d, participation_bias=True)
     print(" ".join(f"{x:.10f}" for x in vb))
     print(" ".join(f"{x:.10f}" for x in vp))
+    if vw is not None:
+        print(" ".join(f"{x:.10f}" for x in vw))
 
 
 if __name__ == "__main__":

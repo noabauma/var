@@ -1469,13 +1469,14 @@ struct ScoreBoard {
     // per team: player 1, player 2, reserve — any slot may be empty
     std::vector<std::array<std::string, 3>> players;
     std::vector<Match> matches;
-    std::vector<double> cache_bias, cache_plain; // per-team; empty = stale
+    std::vector<double> cache_bias, cache_plain, cache_wbias; // empty = stale
     std::string cache_err;
     uint64_t mutations = 0;                  // bumped on every accepted change
     uint64_t hist_stamp = (uint64_t)-1;      // mutations value hist was built at
     std::string impact_cache;                // leave-one-out impacts JSON
     uint64_t impact_stamp = (uint64_t)-1;    // mutations value it was built at
     std::vector<std::vector<double>> hist;   // bias scores after match 1..k
+    double weight_x = 1.0; // "weighted bias" hyperparameter x in [1, 10)
     double damping = 0.85; // PageRank d, set from the web slider; not
                            // persisted — a restart returns to the default
 
@@ -1737,21 +1738,39 @@ struct ScoreBoard {
         msgs.push("scoreboard: seeded demo tournament (last year's group A) -> " + file);
     }
 
+    // "weighted bias" edge weight of one match: the goal-difference share
+    // score = x * |totals_winner - totals_loser| / (games * 10),
+    // x in [1, 10). A match without recorded game scores counts as 1
+    // (the plain binary edge).
+    double weight_of(const Match &mt) const {
+        if (mt.games.empty()) return 1.0;
+        int ta = 0, tb = 0;
+        for (const auto &g : mt.games) { ta += g.a; tb += g.b; }
+        return weight_x * std::abs(ta - tb) / (mt.games.size() * 10.0);
+    }
+
     void recompute_locked() {
         cache_bias.clear();
         cache_plain.clear();
+        cache_wbias.clear();
         cache_err.clear();
         const size_t n = teams.size();
         if (n == 0) return;
         std::vector<double> M(n * n, 0.0); // M[i][j] = 1 if i won the match vs j
+        std::vector<double> W(n * n, 0.0); // goal-difference-weighted variant
         for (const auto &mt : matches) {
             int l = mt.winner == mt.a ? mt.b : mt.a;
             M[(size_t)mt.winner * n + l] += 1.0;
+            W[(size_t)mt.winner * n + l] += weight_of(mt);
         }
         std::string in = std::to_string(n);
         char num[32];
         for (size_t i = 0; i < n * n; i++) {
             std::snprintf(num, sizeof num, " %g", M[i]);
+            in += num;
+        }
+        for (size_t i = 0; i < n * n; i++) {
+            std::snprintf(num, sizeof num, " %g", W[i]);
             in += num;
         }
         in += "\n";
@@ -1764,15 +1783,17 @@ struct ScoreBoard {
         if (!script_ok) { cache_err = err; return; }
         const char *p = out.c_str();
         char *end;
-        for (size_t i = 0; i < 2 * n; i++) { // line 1 bias, line 2 classic
+        for (size_t i = 0; i < 3 * n; i++) { // bias, classic, weighted bias
             double v = strtod(p, &end);
             if (end == p) {
                 cache_err = "unexpected score script output";
                 cache_bias.clear();
                 cache_plain.clear();
+                cache_wbias.clear();
                 return;
             }
-            (i < n ? cache_bias : cache_plain).push_back(v);
+            (i < n ? cache_bias : i < 2 * n ? cache_plain : cache_wbias)
+                .push_back(v);
             p = end;
         }
     }
@@ -1780,7 +1801,8 @@ struct ScoreBoard {
     std::string scores_json() {
         std::lock_guard<std::mutex> lk(m);
         const size_t n = teams.size();
-        if (cache_bias.size() != n || cache_plain.size() != n) recompute_locked();
+        if (cache_bias.size() != n || cache_plain.size() != n ||
+            cache_wbias.size() != n) recompute_locked();
         if (!cache_err.empty()) {
             std::string j = "{\"ok\":false,\"error\":\"";
             json_escape(j, cache_err);
@@ -1794,8 +1816,9 @@ struct ScoreBoard {
         // teams in index order with both scores; the page sorts client-side,
         // so switching algorithms needs no server round-trip
         char buf[160];
-        std::snprintf(buf, sizeof buf, "{\"ok\":true,\"d\":%.4g,\"teams\":[",
-                      damping);
+        std::snprintf(buf, sizeof buf,
+                      "{\"ok\":true,\"d\":%.4g,\"x\":%.4g,\"teams\":[",
+                      damping, weight_x);
         std::string j = buf;
         for (size_t i = 0; i < n; i++) {
             if (i) j += ',';
@@ -1810,8 +1833,10 @@ struct ScoreBoard {
             }
             j += "]";
             std::snprintf(buf, sizeof buf,
-                          ",\"bias\":%.6f,\"plain\":%.6f,\"wins\":%d,\"losses\":%d}",
-                          cache_bias[i], cache_plain[i], wins[i], losses[i]);
+                          ",\"bias\":%.6f,\"plain\":%.6f,\"wbias\":%.6f,"
+                          "\"wins\":%d,\"losses\":%d}",
+                          cache_bias[i], cache_plain[i], cache_wbias[i],
+                          wins[i], losses[i]);
             j += buf;
         }
         j += "],\"matches\":[";
@@ -1946,6 +1971,24 @@ struct ScoreBoard {
     }
 
     // d < 1 keeps the power iteration convergent, hence the 0.99 cap
+    bool set_weight_x(const std::string &raw, std::string &err) {
+        char *end;
+        double v = strtod(raw.c_str(), &end);
+        if (end == raw.c_str() || *end != 0 || !(v >= 1.0 && v < 10.0)) {
+            err = "x must be a number in [1, 10)";
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(m);
+        if (v != weight_x) {
+            weight_x = v;
+            cache_bias.clear();
+            cache_plain.clear();
+            cache_wbias.clear();
+            mutations++; // the weighted ranking and its impacts depend on x
+        }
+        return true;
+    }
+
     bool set_damping(const std::string &raw, std::string &err) {
         char *end;
         double v = strtod(raw.c_str(), &end);
@@ -2041,19 +2084,25 @@ struct ScoreBoard {
         if (impact_stamp != mutations) {
             std::string in = "L " + std::to_string(S) + " " +
                              std::to_string(n);
-            std::vector<double> M(n * n, 0.0);
+            std::vector<double> M(n * n, 0.0), W(n * n, 0.0);
             for (const auto &mt : matches) {
                 int l = mt.winner == mt.a ? mt.b : mt.a;
                 M[(size_t)mt.winner * n + l] += 1.0;
+                W[(size_t)mt.winner * n + l] += weight_of(mt);
             }
-            char num[48];
+            char num[64];
             for (size_t i = 0; i < n * n; i++) {
                 std::snprintf(num, sizeof num, " %g", M[i]);
                 in += num;
             }
+            for (size_t i = 0; i < n * n; i++) {
+                std::snprintf(num, sizeof num, " %g", W[i]);
+                in += num;
+            }
             for (const auto &mt : matches) {
                 int l = mt.winner == mt.a ? mt.b : mt.a;
-                std::snprintf(num, sizeof num, " %d %d", mt.winner, l);
+                std::snprintf(num, sizeof num, " %d %d %.6f", mt.winner, l,
+                              weight_of(mt));
                 in += num;
             }
             in += "\n";
@@ -2068,10 +2117,10 @@ struct ScoreBoard {
             std::string j = "{\"ok\":true,\"impacts\":[";
             const char *p = out.c_str();
             char *end;
-            char buf[160];
+            char buf[224];
             for (size_t k = 0; k < S; k++) {
-                double v[4]; // bias dw/dl, then classic dw/dl
-                for (int i = 0; i < 4; i++) {
+                double v[6]; // bias, classic, weighted-bias dw/dl pairs
+                for (int i = 0; i < 6; i++) {
                     v[i] = strtod(p, &end);
                     if (end == p)
                         return "{\"ok\":false,\"error\":\"unexpected impact output\"}";
@@ -2081,8 +2130,9 @@ struct ScoreBoard {
                 int l = mt.winner == mt.a ? mt.b : mt.a;
                 std::snprintf(buf, sizeof buf,
                               "%s{\"w\":%d,\"l\":%d,\"dw\":%.6f,\"dl\":%.6f,"
-                              "\"pw\":%.6f,\"pl\":%.6f}",
-                              k ? "," : "", mt.winner, l, v[0], v[1], v[2], v[3]);
+                              "\"pw\":%.6f,\"pl\":%.6f,\"ww\":%.6f,\"wl\":%.6f}",
+                              k ? "," : "", mt.winner, l, v[0], v[1], v[2],
+                              v[3], v[4], v[5]);
                 j += buf;
             }
             impact_cache = j + "]}";
@@ -2504,8 +2554,10 @@ button:disabled{opacity:.4;cursor:default}
 #af input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;min-width:8em;flex:1}
 #af button{padding:9px 14px}
 #serr{color:#e57373;font-size:13px;min-height:1.2em;margin-top:6px}
-#algsw{display:flex;gap:8px;margin-bottom:10px;align-items:center}
+#algsw{display:flex;gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap}
 #algsw[hidden]{display:none}
+#xwrap{display:flex;align-items:center;gap:5px;font-size:12px;color:#8b96a5;white-space:nowrap}
+#xwrap input{width:46px;background:#141a21;border:1px solid #1c2530;color:#e6e9ee;border-radius:6px;padding:3px 4px;font:inherit;font-size:12px}
 #algsw button{flex:1;padding:7px 8px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
 #algsw button.on{background:#1c2530;border-color:#3b82f6;color:#fff}
 #dwrap{display:flex;align-items:center;gap:5px;font-size:12px;color:#8b96a5;white-space:nowrap}
@@ -2595,11 +2647,14 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <aside id="scorepane">
 <h2>Tournament</h2>
 <div id="algsw" hidden>
-<button id="algb" class="on">Bias PageRank</button>
-<button id="algp">Classic PageRank</button>
+<button id="algb" class="on" title="bias PageRank (binary win matrix)">Bias</button>
+<button id="algw" title="bias PageRank on the goal-difference-weighted matrix: x*|totals A - totals B|/(games*10)">Weighted</button>
+<button id="algp" title="classic PageRank (binary win matrix)">Classic</button>
 <label id="dwrap" title="PageRank damping factor d (admin only, not persisted)">d
 <input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">
 <input id="dnum" type="number" min="0" max="0.99" step="0.01" value="0.85"></label>
+<label id="xwrap" title="weighted-bias hyperparameter x in [1, 10) (admin only, not persisted)">x
+<input id="xnum" type="number" min="1" max="9.99" step="0.5" value="1"></label>
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 <div id="konote"></div>
@@ -2841,14 +2896,14 @@ function renderDetail(){const d=$('detail');
   const txt=document.createElement('span');
   const lsr=m.winner===m.a?m.b:m.a;
   const im=IMP&&IMP[m.winner+'-'+lsr];
-  const my=im?(won?(alg==='bias'?im.dw:im.pw)
-                  :(alg==='bias'?im.dl:im.pl))*100:null;
+  const my=im?impWL(im)[won?0:1]*100:null;
   txt.textContent='vs '+opp+': '
    +(m.games.length?fmtGames(m,isA):'(no game scores)')
    +' → '+(won?'won':'lost')
-   +(my!==null?' · '+(my>=0?'+':'−')+Math.abs(my).toFixed(2)+' '+alg+' pts':'');
-  if(my!==null)txt.title='leave-one-out: your '+alg+' score with this match '
-   +'minus without it';
+   +(my!==null?' · '+(my>=0?'+':'−')+Math.abs(my).toFixed(2)
+     +' '+ALGN[alg]+' pts':'');
+  if(my!==null)txt.title='leave-one-out: your '+ALGN[alg]+' score with this '
+   +'match minus without it';
   row.appendChild(txt);
   const eb=document.createElement('button');eb.textContent='✎';eb.className='mbtn';
   eb.title='edit game scores';
@@ -2944,8 +2999,7 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
    // standings gap. Gold = the lower-ranked team won (upset).
    const dd=(S.teams[w][alg]-S.teams[l][alg])*100;
    const im=IMP&&IMP[w+'-'+l];
-   const iw=im?(alg==='bias'?im.dw:im.pw):0,
-         il=im?(alg==='bias'?im.dl:im.pl):0; // follow the alg toggle
+   const [iw,il]=im?impWL(im):[0,0]; // follow the alg toggle
    const fs=v=>(v>=0?'+':'−')+Math.abs(v*100).toFixed(2);
    const mx2=x1+(bx-x1)*fr-uy*17,my2=y1+(by-y1)*fr+ux*17;
    const gd=el('text',{x:mx2,y:my2,'text-anchor':'middle',
@@ -2956,11 +3010,10 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
    g.appendChild(gd);}
   const t=document.createElementNS(NS,'title');
   const tim=IMP&&IMP[w+'-'+l];
-  const tw=tim?(alg==='bias'?tim.dw:tim.pw):0,
-        tl=tim?(alg==='bias'?tim.dl:tim.pl):0;
+  const [tw,tl]=tim?impWL(tim):[0,0];
   t.textContent=S.teams[w].name+' beat '+S.teams[l].name
    +(m.games.length?' ('+fmtGames(m,w===m.a)+')':'')
-   +(tim?' — worth '+(tw*100).toFixed(2)+' '+alg+' points to the winner, '
+   +(tim?' — worth '+(tw*100).toFixed(2)+' '+ALGN[alg]+' points to the winner, '
      +(tl*100).toFixed(2)+' to the loser (vs never playing it)':'');
   g.appendChild(t);svg.appendChild(g);edges.push(g);});
  const nodes={};
@@ -3007,6 +3060,7 @@ function renderTable(){if(!S)return;
   tb.appendChild(tr);
   const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
  $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';
+ $('algw').className=alg==='wbias'?'on':'';
  const koDays=Math.ceil((new Date('2026-08-14T23:59:59')-Date.now())/864e5);
  $('konote').innerHTML='&#9876;&#65039; <b>Top 8 advance to the knockout stage</b> &middot; '
   +(koDays>1?'group stage ends 14.08. &mdash; <span class="days">'+koDays+' days left</span>'
@@ -3062,24 +3116,31 @@ function drawRankHist(){const svg=$('rhsvg');if(!svg||!HIST)return;
   g.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
   svg.appendChild(g);});}
 let IMP=null,impKey=''; // per-match impacts, fetched once per table change
+const ALGN={bias:'bias',plain:'classic',wbias:'weighted'};
+const impWL=im=>alg==='bias'?[im.dw,im.dl]:alg==='plain'?[im.pw,im.pl]:[im.ww,im.wl];
 async function impacts(){try{const j=await(await fetch('/scores/impact')).json();
  if(!j.ok)return;IMP={};j.impacts.forEach(im=>IMP[im.w+'-'+im.l]=im);
  renderTable();renderDetail();}catch(e){}}
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
- const k=JSON.stringify([s.d,s.matches]); // results or damping changed?
- if(k!==impKey){impKey=k;impacts();}      // else: keep the stored impacts
+ const k=JSON.stringify([s.d,s.x,s.matches]); // results, d or x changed?
+ if(k!==impKey){impKey=k;impacts();}          // else: keep the stored impacts
  if(S.d!==undefined&&document.activeElement!==$('dsl')&&document.activeElement!==$('dnum')){
   $('dsl').value=S.d;$('dnum').value=(+S.d).toFixed(2);} // don't fight the editing hand
+ if(S.x!==undefined&&document.activeElement!==$('xnum'))$('xnum').value=S.x;
  renderTable();renderDetail();rankhist();}catch(e){}}
-$('algb').onclick=()=>{alg='bias';renderTable();};
-$('algp').onclick=()=>{alg='plain';renderTable();};
+$('algb').onclick=()=>{alg='bias';renderTable();renderDetail();};
+$('algp').onclick=()=>{alg='plain';renderTable();renderDetail();};
+$('algw').onclick=()=>{alg='wbias';renderTable();renderDetail();};
 $('dsl').oninput=()=>{$('dnum').value=(+$('dsl').value).toFixed(2);};
 $('dsl').onchange=()=>post('/scores/d?value='+$('dsl').value);
 $('dnum').onchange=()=>{let v=parseFloat($('dnum').value);
  if(isNaN(v))v=0.85;v=Math.max(0,Math.min(0.99,v));
  $('dnum').value=v.toFixed(2);$('dsl').value=v;post('/scores/d?value='+v);};
+$('xnum').onchange=()=>{let v=parseFloat($('xnum').value);
+ if(isNaN(v))v=1;v=Math.max(1,Math.min(9.99,v));
+ $('xnum').value=v;post('/scores/x?value='+v);};
 $('af').addEventListener('submit',async e=>{e.preventDefault();
  try{const r=await(await fetch('/scores/add?a='+encodeURIComponent($('ta').value)
   +'&b='+encodeURIComponent($('tb2').value)
@@ -3903,6 +3964,15 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
                 scores_mutation(fd, sh,
                                 sh->scores->set_damping(query_str(path, "value"),
                                                         err),
+                                err);
+        } else if (method == "POST" && route == "/scores/x" && sh->scores) {
+            std::string err;
+            if (!admin)
+                scores_error(fd, sh, "403 Forbidden", "x is admin-only");
+            else
+                scores_mutation(fd, sh,
+                                sh->scores->set_weight_x(
+                                    query_str(path, "value"), err),
                                 err);
         }
         else if (method == "GET" && route == "/favicon.ico")

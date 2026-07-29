@@ -2490,8 +2490,9 @@ button:disabled{opacity:.4;cursor:default}
 #gcap .sw:first-child{margin-left:0}
 .ge line{stroke:#5c6672;stroke-width:2}
 .ge polygon{fill:#5c6672}
-.ge.w line{stroke:#81c784}.ge.w polygon{fill:#81c784}
-.ge.l line{stroke:#e57373}.ge.l polygon{fill:#e57373}
+.ge text{fill:#79879a;font-size:9px;pointer-events:none;paint-order:stroke;stroke:#0b0e12;stroke-width:3px}
+.ge.w line{stroke:#81c784}.ge.w polygon{fill:#81c784}.ge.w text{fill:#a5d6a7;font-size:11px;font-weight:700}
+.ge.l line{stroke:#e57373}.ge.l polygon{fill:#e57373}.ge.l text{fill:#ef9a9a;font-size:11px;font-weight:700}
 .ge.dim{opacity:.12}
 .gn{cursor:pointer}
 .gn .dot{fill:#8b96a5}
@@ -2842,6 +2843,14 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
   g.appendChild(el('line',{x1:x1,y1:y1,x2:bx+ux,y2:by+uy}));
   g.appendChild(el('polygon',{points:tx+','+ty+' '+(bx-uy*3.5)+','+(by+ux*3.5)
    +' '+(bx+uy*3.5)+','+(by-ux*3.5)}));
+  if(m.games.length){ // game scores along the edge, winner's view
+   const fr=0.42,mx=x1+(bx-x1)*fr-uy*7,my=y1+(by-y1)*fr+ux*7;
+   let ang=Math.atan2(dy,dx)*180/Math.PI;
+   if(ang>90||ang<-90)ang+=180; // never upside-down
+   const lb=el('text',{x:mx,y:my,'text-anchor':'middle',
+    transform:'rotate('+ang.toFixed(1)+' '+mx+' '+my+')'});
+   lb.textContent=m.games.map(gm=>w===m.a?gm[0]+'-'+gm[1]:gm[1]+'-'+gm[0]).join('  ');
+   g.appendChild(lb);}
   const t=document.createElementNS(NS,'title');
   t.textContent=S.teams[w].name+' beat '+S.teams[l].name
    +(m.games.length?' ('+fmtGames(m,w===m.a)+')':'');

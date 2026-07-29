@@ -3056,13 +3056,15 @@ function drawRankHist(){const svg=$('rhsvg');if(!svg||!HIST)return;
   g.onmouseleave=()=>{svg.classList.remove('dimall');g.classList.remove('hl');};
   g.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
   svg.appendChild(g);});}
-let IMP=null; // per-match leave-one-out bias impacts, keyed "winner-loser"
+let IMP=null,impKey=''; // per-match impacts, fetched once per table change
 async function impacts(){try{const j=await(await fetch('/scores/impact')).json();
  if(!j.ok)return;IMP={};j.impacts.forEach(im=>IMP[im.w+'-'+im.l]=im);
  renderTable();renderDetail();}catch(e){}}
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
- $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;IMP=null;impacts();
+ $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
+ const k=JSON.stringify([s.d,s.matches]); // results or damping changed?
+ if(k!==impKey){impKey=k;impacts();}      // else: keep the stored impacts
  if(S.d!==undefined&&document.activeElement!==$('dsl')&&document.activeElement!==$('dnum')){
   $('dsl').value=S.d;$('dnum').value=(+S.d).toFixed(2);} // don't fight the editing hand
  renderTable();renderDetail();rankhist();}catch(e){}}

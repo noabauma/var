@@ -2491,8 +2491,13 @@ button:disabled{opacity:.4;cursor:default}
 .ge line{stroke:#5c6672;stroke-width:2}
 .ge polygon{fill:#5c6672}
 .ge text{fill:#79879a;font-size:9px;pointer-events:none;paint-order:stroke;stroke:#0b0e12;stroke-width:3px}
+.ge text.gd{font-size:8px;fill:#5c6672}
+.ge text.gd.up{fill:#e5c07b}
 .ge.w line{stroke:#81c784}.ge.w polygon{fill:#81c784}.ge.w text{fill:#a5d6a7;font-size:11px;font-weight:700}
 .ge.l line{stroke:#e57373}.ge.l polygon{fill:#e57373}.ge.l text{fill:#ef9a9a;font-size:11px;font-weight:700}
+.ge.w text.gd,.ge.l text.gd{font-size:10px}
+.ge.w text.gd.up,.ge.l text.gd.up{fill:#e5c07b}
+.gn .gns{fill:#5c6672;font-size:9px;font-weight:400}
 .ge.dim{opacity:.12}
 .gn{cursor:pointer}
 .gn .dot{fill:#8b96a5}
@@ -2850,7 +2855,16 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
    const lb=el('text',{x:mx,y:my,'text-anchor':'middle',
     transform:'rotate('+ang.toFixed(1)+' '+mx+' '+my+')'});
    lb.textContent=m.games.map(gm=>w===m.a?gm[0]+'-'+gm[1]:gm[1]+'-'+gm[0]).join('  ');
-   g.appendChild(lb);}
+   g.appendChild(lb);
+   // PageRank-point gap (current standings, follows the alg toggle);
+   // negative = the lower-ranked team won = an upset, shown in gold
+   const dd=(S.teams[w][alg]-S.teams[l][alg])*100;
+   const mx2=x1+(bx-x1)*fr-uy*17,my2=y1+(by-y1)*fr+ux*17;
+   const gd=el('text',{x:mx2,y:my2,'text-anchor':'middle',
+    'class':'gd'+(dd<0?' up':''),
+    transform:'rotate('+ang.toFixed(1)+' '+mx2+' '+my2+')'});
+   gd.textContent='Δ'+(dd>=0?'+':'')+dd.toFixed(1);
+   g.appendChild(gd);}
   const t=document.createElementNS(NS,'title');
   t.textContent=S.teams[w].name+' beat '+S.teams[l].name
    +(m.games.length?' ('+fmtGames(m,w===m.a)+')':'');
@@ -2864,7 +2878,11 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
         lx=cx+(R+13)*c,ly=cy+(R+13)*s;
   const txt=el('text',{x:lx,y:ly+(s>.5?9:s<-.5?-4:3),
    'text-anchor':c>.25?'start':c<-.25?'end':'middle'});
-  txt.textContent=full;
+  txt.textContent=full+' ';
+  const sc=document.createElementNS(NS,'tspan');
+  sc.setAttribute('class','gns');
+  sc.textContent=(S.teams[ti][alg]*100).toFixed(2);
+  txt.appendChild(sc);
   const t=document.createElementNS(NS,'title');t.textContent=full;
   g.appendChild(t);g.appendChild(txt);
   g.onmouseenter=()=>gHl(ti);

@@ -67,13 +67,16 @@ def main():
         M = np.array(vals, dtype=np.float64).reshape(n, n)
         lines = []
         with contextlib.redirect_stdout(io.StringIO()):
-            base = pagerank_bias(M.copy(), d, participation_bias=True)
+            base_b = pagerank_bias(M.copy(), d, participation_bias=True)
+            base_p = pagerank_plain(M.copy(), d)
             for k in range(S):
                 w, l = pairs[2 * k], pairs[2 * k + 1]
                 M2 = M.copy()
                 M2[w][l] -= 1.0
-                v = pagerank_bias(M2, d, participation_bias=True)
-                lines.append(f"{base[w] - v[w]:.10f} {base[l] - v[l]:.10f}")
+                vb = pagerank_bias(M2.copy(), d, participation_bias=True)
+                vp = pagerank_plain(M2, d)
+                lines.append(f"{base_b[w] - vb[w]:.10f} {base_b[l] - vb[l]:.10f} "
+                             f"{base_p[w] - vp[w]:.10f} {base_p[l] - vp[l]:.10f}")
         print("\n".join(lines))
         return
     n = int(data[0])

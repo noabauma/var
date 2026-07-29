@@ -2068,21 +2068,21 @@ struct ScoreBoard {
             std::string j = "{\"ok\":true,\"impacts\":[";
             const char *p = out.c_str();
             char *end;
-            char buf[96];
+            char buf[160];
             for (size_t k = 0; k < S; k++) {
-                double dw = strtod(p, &end);
-                if (end == p)
-                    return "{\"ok\":false,\"error\":\"unexpected impact output\"}";
-                p = end;
-                double dl = strtod(p, &end);
-                if (end == p)
-                    return "{\"ok\":false,\"error\":\"unexpected impact output\"}";
-                p = end;
+                double v[4]; // bias dw/dl, then classic dw/dl
+                for (int i = 0; i < 4; i++) {
+                    v[i] = strtod(p, &end);
+                    if (end == p)
+                        return "{\"ok\":false,\"error\":\"unexpected impact output\"}";
+                    p = end;
+                }
                 const Match &mt = matches[k];
                 int l = mt.winner == mt.a ? mt.b : mt.a;
                 std::snprintf(buf, sizeof buf,
-                              "%s{\"w\":%d,\"l\":%d,\"dw\":%.6f,\"dl\":%.6f}",
-                              k ? "," : "", mt.winner, l, dw, dl);
+                              "%s{\"w\":%d,\"l\":%d,\"dw\":%.6f,\"dl\":%.6f,"
+                              "\"pw\":%.6f,\"pl\":%.6f}",
+                              k ? "," : "", mt.winner, l, v[0], v[1], v[2], v[3]);
                 j += buf;
             }
             impact_cache = j + "]}";
@@ -2841,12 +2841,13 @@ function renderDetail(){const d=$('detail');
   const txt=document.createElement('span');
   const lsr=m.winner===m.a?m.b:m.a;
   const im=IMP&&IMP[m.winner+'-'+lsr];
-  const my=im?(won?im.dw:im.dl)*100:null;
+  const my=im?(won?(alg==='bias'?im.dw:im.pw)
+                  :(alg==='bias'?im.dl:im.pl))*100:null;
   txt.textContent='vs '+opp+': '
    +(m.games.length?fmtGames(m,isA):'(no game scores)')
    +' → '+(won?'won':'lost')
-   +(my!==null?' · '+(my>=0?'+':'−')+Math.abs(my).toFixed(2)+' bias pts':'');
-  if(my!==null)txt.title='leave-one-out: your bias score with this match '
+   +(my!==null?' · '+(my>=0?'+':'−')+Math.abs(my).toFixed(2)+' '+alg+' pts':'');
+  if(my!==null)txt.title='leave-one-out: your '+alg+' score with this match '
    +'minus without it';
   row.appendChild(txt);
   const eb=document.createElement('button');eb.textContent='✎';eb.className='mbtn';
@@ -2943,20 +2944,24 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
    // standings gap. Gold = the lower-ranked team won (upset).
    const dd=(S.teams[w][alg]-S.teams[l][alg])*100;
    const im=IMP&&IMP[w+'-'+l];
+   const iw=im?(alg==='bias'?im.dw:im.pw):0,
+         il=im?(alg==='bias'?im.dl:im.pl):0; // follow the alg toggle
    const fs=v=>(v>=0?'+':'−')+Math.abs(v*100).toFixed(2);
    const mx2=x1+(bx-x1)*fr-uy*17,my2=y1+(by-y1)*fr+ux*17;
    const gd=el('text',{x:mx2,y:my2,'text-anchor':'middle',
     'class':'gd'+(dd<0?' up':''),
     transform:'rotate('+ang.toFixed(1)+' '+mx2+' '+my2+')'});
-   gd.textContent=im?fs(im.dw)+' ⁄ '+fs(im.dl)
+   gd.textContent=im?fs(iw)+' ⁄ '+fs(il)
     :'Δ'+(dd>=0?'+':'')+dd.toFixed(1);
    g.appendChild(gd);}
   const t=document.createElementNS(NS,'title');
   const tim=IMP&&IMP[w+'-'+l];
+  const tw=tim?(alg==='bias'?tim.dw:tim.pw):0,
+        tl=tim?(alg==='bias'?tim.dl:tim.pl):0;
   t.textContent=S.teams[w].name+' beat '+S.teams[l].name
    +(m.games.length?' ('+fmtGames(m,w===m.a)+')':'')
-   +(tim?' — worth '+(tim.dw*100).toFixed(2)+' bias points to the winner, '
-     +(tim.dl*100).toFixed(2)+' to the loser (vs never playing it)':'');
+   +(tim?' — worth '+(tw*100).toFixed(2)+' '+alg+' points to the winner, '
+     +(tl*100).toFixed(2)+' to the loser (vs never playing it)':'');
   g.appendChild(t);svg.appendChild(g);edges.push(g);});
  const nodes={};
  idx.forEach(ti=>{const p=pos[ti],full=S.teams[ti].name;

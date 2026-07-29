@@ -1738,15 +1738,17 @@ struct ScoreBoard {
         msgs.push("scoreboard: seeded demo tournament (last year's group A) -> " + file);
     }
 
-    // "weighted bias" edge weight of one match: the goal-difference share
-    // score = x * |totals_winner - totals_loser| / (games * 10),
-    // x in [1, 10). A match without recorded game scores counts as 1
-    // (the plain binary edge).
+    // "weighted bias" edge weight of one match:
+    //   1 + x * |totals_winner - totals_loser| / (games * 10)
+    // The win itself always earns the base credit of 1 (a pure scale
+    // would cancel in the PageRank normalization); x in [1, 10) tunes
+    // how much extra a dominant goal difference adds on top. A match
+    // without recorded game scores is just the base credit.
     double weight_of(const Match &mt) const {
         if (mt.games.empty()) return 1.0;
         int ta = 0, tb = 0;
         for (const auto &g : mt.games) { ta += g.a; tb += g.b; }
-        return weight_x * std::abs(ta - tb) / (mt.games.size() * 10.0);
+        return 1.0 + weight_x * std::abs(ta - tb) / (mt.games.size() * 10.0);
     }
 
     void recompute_locked() {
@@ -2648,7 +2650,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <h2>Tournament</h2>
 <div id="algsw" hidden>
 <button id="algb" class="on" title="bias PageRank (binary win matrix)">Bias</button>
-<button id="algw" title="bias PageRank on the goal-difference-weighted matrix: x*|totals A - totals B|/(games*10)">Weighted</button>
+<button id="algw" title="bias PageRank on the goal-difference-weighted matrix: 1 + x*|totals A - totals B|/(games*10)">Weighted</button>
 <button id="algp" title="classic PageRank (binary win matrix)">Classic</button>
 <label id="dwrap" title="PageRank damping factor d (admin only, not persisted)">d
 <input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">

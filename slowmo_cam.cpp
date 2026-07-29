@@ -1473,6 +1473,8 @@ struct ScoreBoard {
     std::string cache_err;
     uint64_t mutations = 0;                  // bumped on every accepted change
     uint64_t hist_stamp = (uint64_t)-1;      // mutations value hist was built at
+    std::string impact_cache;                // leave-one-out impacts JSON
+    uint64_t impact_stamp = (uint64_t)-1;    // mutations value it was built at
     std::vector<std::vector<double>> hist;   // bias scores after match 1..k
     double damping = 0.85; // PageRank d, set from the web slider; not
                            // persisted — a restart returns to the default
@@ -2023,6 +2025,70 @@ struct ScoreBoard {
             j += ']';
         }
         return j + "]}";
+    }
+
+    // Leave-one-out impact of every match on the BIAS scores: for each
+    // match, the bias PageRank is recomputed WITHOUT it — dw is what the
+    // win adds to the winner and dl what the loss does to the loser,
+    // versus a tournament in which that match never happened. (With the
+    // participation baseline, dl can come out positive: playing and
+    // losing may still beat not playing.) Cached until the next mutation.
+    std::string impact_json() {
+        std::lock_guard<std::mutex> lk(m);
+        const size_t n = teams.size();
+        const size_t S = matches.size();
+        if (n == 0 || S == 0) return "{\"ok\":true,\"impacts\":[]}";
+        if (impact_stamp != mutations) {
+            std::string in = "L " + std::to_string(S) + " " +
+                             std::to_string(n);
+            std::vector<double> M(n * n, 0.0);
+            for (const auto &mt : matches) {
+                int l = mt.winner == mt.a ? mt.b : mt.a;
+                M[(size_t)mt.winner * n + l] += 1.0;
+            }
+            char num[48];
+            for (size_t i = 0; i < n * n; i++) {
+                std::snprintf(num, sizeof num, " %g", M[i]);
+                in += num;
+            }
+            for (const auto &mt : matches) {
+                int l = mt.winner == mt.a ? mt.b : mt.a;
+                std::snprintf(num, sizeof num, " %d %d", mt.winner, l);
+                in += num;
+            }
+            in += "\n";
+            char darg[16];
+            std::snprintf(darg, sizeof darg, "%.4f", damping);
+            std::string out, err;
+            if (!run_script(script, darg, in, out, err, 60000)) {
+                std::string j = "{\"ok\":false,\"error\":\"";
+                json_escape(j, err);
+                return j + "\"}";
+            }
+            std::string j = "{\"ok\":true,\"impacts\":[";
+            const char *p = out.c_str();
+            char *end;
+            char buf[96];
+            for (size_t k = 0; k < S; k++) {
+                double dw = strtod(p, &end);
+                if (end == p)
+                    return "{\"ok\":false,\"error\":\"unexpected impact output\"}";
+                p = end;
+                double dl = strtod(p, &end);
+                if (end == p)
+                    return "{\"ok\":false,\"error\":\"unexpected impact output\"}";
+                p = end;
+                const Match &mt = matches[k];
+                int l = mt.winner == mt.a ? mt.b : mt.a;
+                std::snprintf(buf, sizeof buf,
+                              "%s{\"w\":%d,\"l\":%d,\"dw\":%.6f,\"dl\":%.6f}",
+                              k ? "," : "", mt.winner, l, dw, dl);
+                j += buf;
+            }
+            impact_cache = j + "]}";
+            impact_stamp = mutations;
+        }
+        return impact_cache;
     }
 
     bool add_team(const std::string &raw, const std::string &p1,
@@ -2773,9 +2839,15 @@ function renderDetail(){const d=$('detail');
  ms.forEach(m=>{const isA=m.a===selTeam,opp=S.teams[isA?m.b:m.a].name,won=m.winner===selTeam;
   const row=document.createElement('div');row.className='mrow '+(won?'w':'l');
   const txt=document.createElement('span');
+  const lsr=m.winner===m.a?m.b:m.a;
+  const im=IMP&&IMP[m.winner+'-'+lsr];
+  const my=im?(won?im.dw:im.dl)*100:null;
   txt.textContent='vs '+opp+': '
    +(m.games.length?fmtGames(m,isA):'(no game scores)')
-   +' → '+(won?'won':'lost');
+   +' → '+(won?'won':'lost')
+   +(my!==null?' · '+(my>=0?'+':'−')+Math.abs(my).toFixed(2)+' bias pts':'');
+  if(my!==null)txt.title='leave-one-out: your bias score with this match '
+   +'minus without it';
   row.appendChild(txt);
   const eb=document.createElement('button');eb.textContent='✎';eb.className='mbtn';
   eb.title='edit game scores';
@@ -2856,18 +2928,26 @@ function renderGraph(idx){const NS='http://www.w3.org/2000/svg',svg=$('gsvg');
     transform:'rotate('+ang.toFixed(1)+' '+mx+' '+my+')'});
    lb.textContent=m.games.map(gm=>w===m.a?gm[0]+'-'+gm[1]:gm[1]+'-'+gm[0]).join('  ');
    g.appendChild(lb);
-   // PageRank-point gap (current standings, follows the alg toggle);
-   // negative = the lower-ranked team won = an upset, shown in gold
+   // second line: the match's leave-one-out impact on the BIAS scores
+   // (what the win is worth to the winner / the loss to the loser vs a
+   // tournament without this match). Until it arrives: the current
+   // standings gap. Gold = the lower-ranked team won (upset).
    const dd=(S.teams[w][alg]-S.teams[l][alg])*100;
+   const im=IMP&&IMP[w+'-'+l];
+   const fs=v=>(v>=0?'+':'−')+Math.abs(v*100).toFixed(2);
    const mx2=x1+(bx-x1)*fr-uy*17,my2=y1+(by-y1)*fr+ux*17;
    const gd=el('text',{x:mx2,y:my2,'text-anchor':'middle',
     'class':'gd'+(dd<0?' up':''),
     transform:'rotate('+ang.toFixed(1)+' '+mx2+' '+my2+')'});
-   gd.textContent='Δ'+(dd>=0?'+':'')+dd.toFixed(1);
+   gd.textContent=im?fs(im.dw)+' ⁄ '+fs(im.dl)
+    :'Δ'+(dd>=0?'+':'')+dd.toFixed(1);
    g.appendChild(gd);}
   const t=document.createElementNS(NS,'title');
+  const tim=IMP&&IMP[w+'-'+l];
   t.textContent=S.teams[w].name+' beat '+S.teams[l].name
-   +(m.games.length?' ('+fmtGames(m,w===m.a)+')':'');
+   +(m.games.length?' ('+fmtGames(m,w===m.a)+')':'')
+   +(tim?' — worth '+(tim.dw*100).toFixed(2)+' bias points to the winner, '
+     +(tim.dl*100).toFixed(2)+' to the loser (vs never playing it)':'');
   g.appendChild(t);svg.appendChild(g);edges.push(g);});
  const nodes={};
  idx.forEach(ti=>{const p=pos[ti],full=S.teams[ti].name;
@@ -2967,9 +3047,13 @@ function drawRankHist(){const svg=$('rhsvg');if(!svg||!HIST)return;
   g.onmouseleave=()=>{svg.classList.remove('dimall');g.classList.remove('hl');};
   g.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
   svg.appendChild(g);});}
+let IMP=null; // per-match leave-one-out bias impacts, keyed "winner-loser"
+async function impacts(){try{const j=await(await fetch('/scores/impact')).json();
+ if(!j.ok)return;IMP={};j.impacts.forEach(im=>IMP[im.w+'-'+im.l]=im);
+ renderTable();renderDetail();}catch(e){}}
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
- $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
+ $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;IMP=null;impacts();
  if(S.d!==undefined&&document.activeElement!==$('dsl')&&document.activeElement!==$('dnum')){
   $('dsl').value=S.d;$('dnum').value=(+S.d).toFixed(2);} // don't fight the editing hand
  renderTable();renderDetail();rankhist();}catch(e){}}
@@ -3717,6 +3801,9 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_status(fd, cfg, sh, admin);
         else if (method == "GET" && route == "/scores")
             handle_scores(fd, sh);
+        else if (method == "GET" && route == "/scores/impact" && sh->scores)
+            send_simple(fd, sh, "200 OK", "application/json",
+                        sh->scores->impact_json());
         else if (method == "GET" && route == "/scores/history" && sh->scores)
             send_simple(fd, sh, "200 OK", "application/json",
                         sh->scores->history_json());

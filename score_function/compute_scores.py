@@ -52,6 +52,30 @@ def main():
                 lines.append(" ".join(f"{x:.10f}" for x in v))
         print("\n".join(lines))
         return
+    if data and data[0] == "L":
+        # leave-one-out mode: the impact of each match on the BIAS scores.
+        # input: L S n, the full n*n matrix, then S (winner, loser) index
+        # pairs. Output: S lines "dw dl" — winner's score with the match
+        # minus without it, and the same for the loser — i.e. how many
+        # points the win adds and the loss costs vs a tournament in which
+        # that match was never played.
+        S, n = int(data[1]), int(data[2])
+        vals = [float(x) for x in data[3:3 + n * n]]
+        pairs = [int(x) for x in data[3 + n * n:3 + n * n + 2 * S]]
+        if len(vals) != n * n or len(pairs) != 2 * S:
+            sys.exit("leave-one-out data incomplete")
+        M = np.array(vals, dtype=np.float64).reshape(n, n)
+        lines = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            base = pagerank_bias(M.copy(), d, participation_bias=True)
+            for k in range(S):
+                w, l = pairs[2 * k], pairs[2 * k + 1]
+                M2 = M.copy()
+                M2[w][l] -= 1.0
+                v = pagerank_bias(M2, d, participation_bias=True)
+                lines.append(f"{base[w] - v[w]:.10f} {base[l] - v[l]:.10f}")
+        print("\n".join(lines))
+        return
     n = int(data[0])
     if n <= 0:
         print()

@@ -2428,6 +2428,12 @@ button:disabled{opacity:.4;cursor:default}
 #board th,#scorepane th{color:#5c6672;font-size:12px}
 #board td:first-child,#board th:first-child,#scorepane td:first-child,#scorepane th:first-child{width:2em;color:#5c6672}
 #board td:nth-child(n+3),#board th:nth-child(n+3),#scorepane td:nth-child(n+3),#scorepane th:nth-child(n+3){text-align:right}
+#tb tr.qual{background:rgba(34,197,94,.07)}
+#tb tr.qual td:first-child{border-left:3px solid #22c55e;color:#22c55e;font-weight:700}
+#tb tr.cutline td{border-bottom:2px dashed #e5c07b}
+#konote{font-size:12px;color:#8b96a5;margin-top:8px;line-height:1.5}
+#konote b{color:#22c55e}
+#konote .days{color:#e5c07b;font-weight:700}
 #af{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
 #af input{font:inherit;background:#141a21;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px;min-width:8em;flex:1}
 #af button{padding:9px 14px}
@@ -2437,8 +2443,8 @@ button:disabled{opacity:.4;cursor:default}
 #algsw button{flex:1;padding:7px 8px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
 #algsw button.on{background:#1c2530;border-color:#3b82f6;color:#fff}
 #dwrap{display:flex;align-items:center;gap:5px;font-size:12px;color:#8b96a5;white-space:nowrap}
-#dwrap input{width:70px;accent-color:#3b82f6}
-#dval{min-width:30px;color:#e6e9ee}
+#dwrap input[type=range]{width:52px;accent-color:#3b82f6}
+#dwrap input[type=number]{width:46px;background:#141a21;border:1px solid #1c2530;color:#e6e9ee;border-radius:6px;padding:3px 4px;font:inherit;font-size:12px}
 #scorepane tbody tr{cursor:pointer}
 #scorepane tbody tr:hover td,#scorepane tr.sel td{background:#141a21}
 #detail{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:12px;margin-top:10px;font-size:14px}
@@ -2468,6 +2474,8 @@ button:disabled{opacity:.4;cursor:default}
 #rhwrap{overflow-x:auto}
 #rhsvg{width:100%;height:auto;display:block}
 .rh-grid{stroke:#151c25;stroke-width:1}
+.rh-cut{stroke:#e5c07b;stroke-width:1.5;stroke-dasharray:7 5}
+.rh-cutlbl{fill:#e5c07b;font-size:10px;letter-spacing:.5px}
 .rh-rank,.rh-x{fill:#5c6672;font:11px system-ui,sans-serif}
 .rh-lbl{fill:#aeb9c7;font:11px system-ui,sans-serif}
 .rh-line{fill:none;stroke:#3b4652;stroke-width:2;stroke-linejoin:round}
@@ -2519,9 +2527,10 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button id="algp">Classic PageRank</button>
 <label id="dwrap" title="PageRank damping factor d (admin only, not persisted)">d
 <input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">
-<span id="dval">0.85</span></label>
+<input id="dnum" type="number" min="0" max="0.99" step="0.01" value="0.85"></label>
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
+<div id="konote"></div>
 </aside>
 <div id="wrap"><img id="cam" src="/stream" alt="live"><video id="vid" controls playsinline hidden></video><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="livematch" hidden></div><div id="goalspeed" hidden></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
 </main>
@@ -2870,10 +2879,19 @@ function renderTable(){if(!S)return;
   tr.onclick=()=>{selTeam=ti;renderDetail();renderTable();};
   const tpl=(t.players||[]).filter(Boolean);
   if(tpl.length)tr.title='Players: '+tpl.join(', ');
-  if(ti===selTeam)tr.className='sel';
+  let cls=r<8?'qual':''; // green zone: these 8 reach the knockout stage
+  if(r===7)cls+=' cutline';
+  if(ti===selTeam)cls+=' sel';
+  tr.className=cls.trim();
   tb.appendChild(tr);
   const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
  $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';
+ const koDays=Math.ceil((new Date('2026-08-14T23:59:59')-Date.now())/864e5);
+ $('konote').innerHTML='&#9876;&#65039; <b>Top 8 advance to the knockout stage</b> &middot; '
+  +(koDays>1?'group stage ends 14.08. &mdash; <span class="days">'+koDays+' days left</span>'
+   :koDays===1?'group stage ends <span class="days">TOMORROW</span>'
+   :koDays===0?'<span class="days">LAST DAY of the group stage!</span>'
+   :'group stage finished &mdash; bracket time');
  renderVs(idx);renderGraph(idx);}
 let HIST=null;
 async function rankhist(){try{const h=await(await fetch('/scores/history')).json();
@@ -2898,6 +2916,11 @@ function drawRankHist(){const svg=$('rhsvg');if(!svg||!HIST)return;
   svg.appendChild(el('line',{x1:ML,y1:Y(r),x2:W-MR,y2:Y(r),'class':'rh-grid'}));
   const t=el('text',{x:ML-6,y:Y(r)+4,'text-anchor':'end','class':'rh-rank'});
   t.textContent=r;svg.appendChild(t);}
+ if(n>8){ // the knockout cut: stay above this line
+  const cy=(Y(8)+Y(9))/2;
+  svg.appendChild(el('line',{x1:ML,y1:cy,x2:W-MR,y2:cy,'class':'rh-cut'}));
+  const cl=el('text',{x:ML+4,y:cy-5,'class':'rh-cutlbl'});
+  cl.textContent='knockout cut';svg.appendChild(cl);}
  const stepEvery=Math.max(1,Math.ceil(S2/14));
  for(let k=0;k<S2;k+=stepEvery){
   const t=el('text',{x:X(k),y:H-8,'text-anchor':'middle','class':'rh-x'});
@@ -2920,13 +2943,16 @@ function drawRankHist(){const svg=$('rhsvg');if(!svg||!HIST)return;
 async function scores(){try{const s=await(await fetch('/scores')).json();
  if(!s.ok){$('serr').textContent=s.error;return;}
  $('serr').textContent='';S=s;if(selTeam>=S.teams.length)selTeam=-1;
- if(S.d!==undefined&&document.activeElement!==$('dsl')){ // don't fight the dragging hand
-  $('dsl').value=S.d;$('dval').textContent=(+S.d).toFixed(2);}
+ if(S.d!==undefined&&document.activeElement!==$('dsl')&&document.activeElement!==$('dnum')){
+  $('dsl').value=S.d;$('dnum').value=(+S.d).toFixed(2);} // don't fight the editing hand
  renderTable();renderDetail();rankhist();}catch(e){}}
 $('algb').onclick=()=>{alg='bias';renderTable();};
 $('algp').onclick=()=>{alg='plain';renderTable();};
-$('dsl').oninput=()=>{$('dval').textContent=(+$('dsl').value).toFixed(2);};
+$('dsl').oninput=()=>{$('dnum').value=(+$('dsl').value).toFixed(2);};
 $('dsl').onchange=()=>post('/scores/d?value='+$('dsl').value);
+$('dnum').onchange=()=>{let v=parseFloat($('dnum').value);
+ if(isNaN(v))v=0.85;v=Math.max(0,Math.min(0.99,v));
+ $('dnum').value=v.toFixed(2);$('dsl').value=v;post('/scores/d?value='+v);};
 $('af').addEventListener('submit',async e=>{e.preventDefault();
  try{const r=await(await fetch('/scores/add?a='+encodeURIComponent($('ta').value)
   +'&b='+encodeURIComponent($('tb2').value)

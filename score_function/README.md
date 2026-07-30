@@ -9,7 +9,9 @@ by the scoreboard. Open this file with VS Code's Markdown preview
 
 For $n$ teams, the **win matrix** $M \in \mathbb{R}^{n\times n}$ is
 
-$$M_{ij} = \#\{\text{matches team } i \text{ won against team } j\},$$
+```math
+M_{ij} = \#\{\text{matches team } i \text{ won against team } j\},
+```
 
 so row $i$ holds team $i$'s wins and column $j$ holds team $j$'s losses.
 Each win is a *link from the loser to the winner*: rank flows from the

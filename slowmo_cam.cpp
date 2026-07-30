@@ -1476,7 +1476,7 @@ struct ScoreBoard {
     std::string impact_cache;                // leave-one-out impacts JSON
     uint64_t impact_stamp = (uint64_t)-1;    // mutations value it was built at
     std::vector<std::vector<double>> hist;   // bias scores after match 1..k
-    double weight_x = 1.0; // "weighted bias" hyperparameter x in [1, 10)
+    double weight_x = 1.0; // "weighted bias" hyperparameter x in [0, 10)
     double damping = 0.85; // PageRank d, set from the web slider; not
                            // persisted — a restart returns to the default
 
@@ -1738,17 +1738,19 @@ struct ScoreBoard {
         msgs.push("scoreboard: seeded demo tournament (last year's group A) -> " + file);
     }
 
-    // "weighted bias" edge weight of one match:
-    //   1 + x * |totals_winner - totals_loser| / (games * 10)
-    // The win itself always earns the base credit of 1 (a pure scale
-    // would cancel in the PageRank normalization); x in [1, 10) tunes
-    // how much extra a dominant goal difference adds on top. A match
-    // without recorded game scores is just the base credit.
+    // "weighted bias" edge weight of one match: the goal-difference share
+    //   x * |totals_winner - totals_loser| / (games * 10)
+    // x stays pinned at 1: as a global factor it cancels in the PageRank
+    // normalization anyway — only the relative spread between narrow and
+    // dominant wins reaches the ranking. (POST /scores/x still exists for
+    // experiments, provably without effect.) A match without recorded
+    // game scores counts as a plain binary edge; a totals-tied match
+    // contributes nothing.
     double weight_of(const Match &mt) const {
         if (mt.games.empty()) return 1.0;
         int ta = 0, tb = 0;
         for (const auto &g : mt.games) { ta += g.a; tb += g.b; }
-        return 1.0 + weight_x * std::abs(ta - tb) / (mt.games.size() * 10.0);
+        return weight_x * std::abs(ta - tb) / (mt.games.size() * 10.0);
     }
 
     void recompute_locked() {
@@ -1976,8 +1978,8 @@ struct ScoreBoard {
     bool set_weight_x(const std::string &raw, std::string &err) {
         char *end;
         double v = strtod(raw.c_str(), &end);
-        if (end == raw.c_str() || *end != 0 || !(v >= 1.0 && v < 10.0)) {
-            err = "x must be a number in [1, 10)";
+        if (end == raw.c_str() || *end != 0 || !(v >= 0.0 && v < 10.0)) {
+            err = "x must be a number in [0, 10)"; // 0 = plain binary edges
             return false;
         }
         std::lock_guard<std::mutex> lk(m);
@@ -2558,8 +2560,6 @@ button:disabled{opacity:.4;cursor:default}
 #serr{color:#e57373;font-size:13px;min-height:1.2em;margin-top:6px}
 #algsw{display:flex;gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap}
 #algsw[hidden]{display:none}
-#xwrap{display:flex;align-items:center;gap:5px;font-size:12px;color:#8b96a5;white-space:nowrap}
-#xwrap input{width:46px;background:#141a21;border:1px solid #1c2530;color:#e6e9ee;border-radius:6px;padding:3px 4px;font:inherit;font-size:12px}
 #algsw button{flex:1;padding:7px 8px;font-size:13px;background:#0b0e12;border:1px solid #1c2530}
 #algsw button.on{background:#1c2530;border-color:#3b82f6;color:#fff}
 #dwrap{display:flex;align-items:center;gap:5px;font-size:12px;color:#8b96a5;white-space:nowrap}
@@ -2650,13 +2650,11 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <h2>Tournament</h2>
 <div id="algsw" hidden>
 <button id="algb" class="on" title="bias PageRank (binary win matrix)">Bias</button>
-<button id="algw" title="bias PageRank on the goal-difference-weighted matrix: 1 + x*|totals A - totals B|/(games*10)">Weighted</button>
+<button id="algw" title="bias PageRank on the goal-difference-weighted matrix: |totals A - totals B|/(games*10)">Weighted</button>
 <button id="algp" title="classic PageRank (binary win matrix)">Classic</button>
 <label id="dwrap" title="PageRank damping factor d (admin only, not persisted)">d
 <input id="dsl" type="range" min="0" max="0.99" step="0.01" value="0.85">
 <input id="dnum" type="number" min="0" max="0.99" step="0.01" value="0.85"></label>
-<label id="xwrap" title="weighted-bias hyperparameter x in [1, 10) (admin only, not persisted)">x
-<input id="xnum" type="number" min="1" max="9.99" step="0.5" value="1"></label>
 </div>
 <table><thead><tr><th>#</th><th>team</th><th>score</th><th>W</th><th>L</th></tr></thead><tbody id="tb"></tbody></table>
 <div id="konote"></div>
@@ -3130,7 +3128,6 @@ async function scores(){try{const s=await(await fetch('/scores')).json();
  if(k!==impKey){impKey=k;impacts();}          // else: keep the stored impacts
  if(S.d!==undefined&&document.activeElement!==$('dsl')&&document.activeElement!==$('dnum')){
   $('dsl').value=S.d;$('dnum').value=(+S.d).toFixed(2);} // don't fight the editing hand
- if(S.x!==undefined&&document.activeElement!==$('xnum'))$('xnum').value=S.x;
  renderTable();renderDetail();rankhist();}catch(e){}}
 $('algb').onclick=()=>{alg='bias';renderTable();renderDetail();};
 $('algp').onclick=()=>{alg='plain';renderTable();renderDetail();};
@@ -3140,9 +3137,6 @@ $('dsl').onchange=()=>post('/scores/d?value='+$('dsl').value);
 $('dnum').onchange=()=>{let v=parseFloat($('dnum').value);
  if(isNaN(v))v=0.85;v=Math.max(0,Math.min(0.99,v));
  $('dnum').value=v.toFixed(2);$('dsl').value=v;post('/scores/d?value='+v);};
-$('xnum').onchange=()=>{let v=parseFloat($('xnum').value);
- if(isNaN(v))v=1;v=Math.max(1,Math.min(9.99,v));
- $('xnum').value=v;post('/scores/x?value='+v);};
 $('af').addEventListener('submit',async e=>{e.preventDefault();
  try{const r=await(await fetch('/scores/add?a='+encodeURIComponent($('ta').value)
   +'&b='+encodeURIComponent($('tb2').value)

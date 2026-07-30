@@ -78,41 +78,38 @@
 <body>
 <div class="viz-root">
   <h1>Weighted-bias edge weight — how much a win is worth</h1>
-  <p class="sub">weight <code>w = 1 + x·|T_A − T_B| / (10·G)</code>, team A always
+  <p class="sub">weight <code>w = |T_A − T_B| / (10·G)</code>, team A always
     wins every game (T_A = 10·G); the x-axis is the opponent's goal total T_B.</p>
   <div class="legend" id="legend"></div>
   <div class="panels">
-    <div class="panel"><h2>2-game match &nbsp;(T_A = 20)</h2><div id="p0"></div></div>
-    <div class="panel"><h2>3-game match &nbsp;(T_A = 30)</h2><div id="p1"></div></div>
+    <div class="panel" style="max-width:760px"><div id="p0"></div></div>
   </div>
-  <p class="note">Reading it: a shutout (T_B = 0) is worth the full <code>1 + x</code>;
-    the weight falls linearly to just above the base credit 1 as the opponent keeps up.
-    The slope is what x controls — at x = 1 domination barely matters, at x = 8 a sweep
-    counts nearly nine times a nail-biter. N.B. the right panel is partly theoretical:
-    in a real best-of-three a 3-game winner has conceded a game, so T_A ≤ 29 and
-    T_B ≥ 10 — real matches live on the right half of that panel.</p>
+  <p class="note">Reading it: a shutout (T_B = 0) is worth a full unit of edge
+    weight; the weight falls linearly to 0 as the opponent catches up — dominant
+    wins carry rank flow, nail-biters barely any, totals-ties none. There is no
+    hyperparameter: a global factor would cancel in the PageRank normalization.
+    N.B. the 3-game line is partly theoretical: in a real best-of-three a 3-game
+    winner has conceded a game, so T_A ≤ 29 and T_B ≥ 10.</p>
   <details><summary>Data table</summary><div id="tbl"></div></details>
   <div class="tip" id="tip"></div>
 </div>
 <script>
 'use strict';
-const XS = [1, 4, 8];
-const COLS = ['var(--series-1)', 'var(--series-2)', 'var(--series-3)'];
-const PANELS = [
-  { games: 2, ta: 20, bmax: 18 },
-  { games: 3, ta: 30, bmax: 27 },
-];
+const GS = [ { games: 2, ta: 20, bmax: 18 }, { games: 3, ta: 30, bmax: 27 } ];
+const COLS = ['var(--series-1)', 'var(--series-2)'];
+const PANELS = [ { bmax: 27 } ];
 const W = 560, H = 380, ML = 46, MR = 64, MT = 12, MB = 44;
-const YMAX = 9.4, YMIN = 0.8;
-const weight = (x, g, b) => 1 + x * (10 * g - b) / (10 * g);
+const YMAX = 1.06, YMIN = 0;
+const weight = (g, b) => (10 * g - b) / (10 * g);
 const NS = 'http://www.w3.org/2000/svg';
 const el = (t, at) => { const e = document.createElementNS(NS, t);
   for (const k in at) e.setAttribute(k, at[k]); return e; };
 
 // legend (identity never color-alone: chip + text token)
-XS.forEach((x, i) => {
+GS.forEach((g, i) => {
   const s = document.createElement('span');
-  s.innerHTML = '<span class="chip" style="background:' + COLS[i] + '"></span>x = ' + x;
+  s.innerHTML = '<span class="chip" style="background:' + COLS[i] + '"></span>' +
+                g.games + '-game match (T_A = ' + g.ta + ')';
   document.getElementById('legend').appendChild(s);
 });
 
@@ -121,13 +118,13 @@ PANELS.forEach((P, pi) => {
   const svg = el('svg', { viewBox: `0 0 ${W} ${H}` });
   const X = b => ML + (W - ML - MR) * b / P.bmax;
   const Y = w => MT + (H - MT - MB) * (YMAX - w) / (YMAX - YMIN);
-  for (let w = 1; w <= 9; w += 2) {           // recessive horizontal grid
+  for (let w = 0; w <= 1.001; w += 0.25) {           // recessive horizontal grid
     svg.appendChild(el('line', { x1: ML, y1: Y(w), x2: W - MR, y2: Y(w), class: 'gridline' }));
     const t = el('text', { x: ML - 8, y: Y(w) + 4, 'text-anchor': 'end', class: 'ticktext' });
-    t.textContent = w; svg.appendChild(t);
+    t.textContent = w.toFixed(2); svg.appendChild(t);
   }
   svg.appendChild(el('line', { x1: ML, y1: Y(YMIN), x2: W - MR, y2: Y(YMIN), class: 'axis' }));
-  const step = P.bmax === 18 ? 3 : 3;
+  const step = 3;
   for (let b = 0; b <= P.bmax; b += step) {
     const t = el('text', { x: X(b), y: H - MB + 18, 'text-anchor': 'middle', class: 'ticktext' });
     t.textContent = b; svg.appendChild(t);
@@ -137,23 +134,23 @@ PANELS.forEach((P, pi) => {
   const yt = el('text', { x: 12, y: MT + 4, class: 'axistitle' });
   yt.textContent = 'w'; svg.appendChild(yt);
 
-  XS.forEach((x, i) => {                       // 2px lines, fixed hue order
+  GS.forEach((g, i) => {                       // 2px lines, fixed hue order
     const pts = [];
-    for (let b = 0; b <= P.bmax; b++) pts.push(X(b) + ',' + Y(weight(x, P.games, b)));
+    for (let b = 0; b <= g.bmax; b++) pts.push(X(b) + ',' + Y(weight(g.games, b)));
     svg.appendChild(el('polyline', { points: pts.join(' '), class: 'line',
                                      stroke: COLS[i] }));
     // selective direct label at the line's right end (text token + chip)
-    const ly = Y(weight(x, P.games, P.bmax));
-    svg.appendChild(el('line', { x1: W - MR + 4, y1: ly, x2: W - MR + 16, y2: ly,
+    const lx = X(g.bmax), ly = Y(weight(g.games, g.bmax));
+    svg.appendChild(el('line', { x1: lx + 5, y1: ly, x2: lx + 17, y2: ly,
                                  stroke: COLS[i], class: 'dlbl-chip' }));
-    const dl = el('text', { x: W - MR + 20, y: ly + 4, class: 'dlbl' });
-    dl.textContent = 'x=' + x; svg.appendChild(dl);
+    const dl = el('text', { x: lx + 21, y: ly + 4, class: 'dlbl' });
+    dl.textContent = 'G=' + g.games; svg.appendChild(dl);
   });
 
   // hover layer: crosshair + shared tooltip, hit target = whole plot area
   const cross = el('line', { y1: MT, y2: H - MB, class: 'crosshair' });
   svg.appendChild(cross);
-  const dots = XS.map((x, i) => { const d = el('circle', { r: 4.5, fill: COLS[i],
+  const dots = GS.map((g, i) => { const d = el('circle', { r: 4.5, fill: COLS[i],
     class: 'hoverdot' }); svg.appendChild(d); return d; });
   const hit = el('rect', { x: ML, y: MT, width: W - ML - MR, height: H - MT - MB,
                            fill: 'transparent' });
@@ -164,14 +161,14 @@ PANELS.forEach((P, pi) => {
     const b = Math.max(0, Math.min(P.bmax, Math.round((fx - ML) / (W - ML - MR) * P.bmax)));
     cross.setAttribute('x1', X(b)); cross.setAttribute('x2', X(b));
     cross.style.opacity = 1;
-    let html = '<div style="color:var(--text-secondary)">T_B = ' + b +
-               ' &nbsp;(' + P.games + ' games)</div>';
-    XS.forEach((x, i) => {
-      const w = weight(x, P.games, b);
+    let html = '<div style="color:var(--text-secondary)">T_B = ' + b + '</div>';
+    GS.forEach((g, i) => {
+      if (b > g.bmax) { dots[i].style.opacity = 0; return; }
+      const w = weight(g.games, b);
       dots[i].setAttribute('cx', X(b)); dots[i].setAttribute('cy', Y(w));
       dots[i].style.opacity = 1;
       html += '<div><span class="chip" style="background:' + COLS[i] + '"></span>' +
-              'x = ' + x + ': <b>w = ' + w.toFixed(2) + '</b></div>';
+              g.games + ' games: <b>w = ' + w.toFixed(3) + '</b></div>';
     });
     tip.innerHTML = html;
     tip.style.opacity = 1;
@@ -187,13 +184,13 @@ PANELS.forEach((P, pi) => {
 
 // table view (accessibility fallback)
 let th = '<table><tr><th>T_B</th>';
-PANELS.forEach(P => XS.forEach(x => th += '<th>G=' + P.games + ', x=' + x + '</th>'));
+GS.forEach(g => th += '<th>G=' + g.games + '</th>');
 th += '</tr>';
 for (let b = 0; b <= 27; b += 3) {
   th += '<tr><td>' + b + '</td>';
-  PANELS.forEach(P => XS.forEach(x => {
-    th += '<td>' + (b <= P.bmax ? weight(x, P.games, b).toFixed(2) : '—') + '</td>';
-  }));
+  GS.forEach(g => {
+    th += '<td>' + (b <= g.bmax ? weight(g.games, b).toFixed(3) : '—') + '</td>';
+  });
   th += '</tr>';
 }
 document.getElementById('tbl').innerHTML = th + '</table>';

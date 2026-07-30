@@ -116,11 +116,12 @@ are the single source of truth — edit them and the board follows
 (`recursive_deletion` is deliberately not applied mid-tournament).
 A third ranking, **weighted bias**, runs the bias algorithm on a
 goal-difference-weighted matrix: each match's edge weight is
-`1 + x·|totals_A − totals_B| / (games·10)` — the win itself always earns
-the base credit, and hyperparameter `x ∈ [1, 10)` (`POST /scores/x`)
-tunes how much a dominant goal difference adds on top. The bias/weighted/classic switch, the damping-d
-slider (default 0.85) and the x input are visible to the `admin` login
-only and admin-gated server-side; neither d nor x is persisted.
+`|totals_A − totals_B| / (games·10)` — dominant wins carry more rank
+flow, ties carry none (a global factor on this weight would cancel in
+the PageRank normalization, so there is no hyperparameter; see
+`score_function/README.md`). The bias/weighted/classic switch and the
+damping-d slider (default 0.85, not persisted) are visible to the
+`admin` login only and admin-gated server-side.
 
 One big group; a match is **best of three** to 10; **each pair plays at most
 once**. Enter *team A*, *team B*, game scores from A's view

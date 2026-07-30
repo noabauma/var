@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weighted-bias edge weight function</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; }
+  .viz-root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --grid: #e4e3df;
+    --series-1: #2a78d6;  /* x = 1 */
+    --series-2: #eb6834;  /* x = 4 */
+    --series-3: #1baf7a;  /* x = 8 */
+    background: var(--surface-1);
+    color: var(--text-primary);
+    min-height: 100vh;
+    padding: 20px clamp(12px, 4vw, 48px) 40px;
+    box-sizing: border-box;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1: #1a1a19; --text-primary: #ffffff;
+      --text-secondary: #c3c2b7; --grid: #34332f;
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --text-primary: #ffffff;
+    --text-secondary: #c3c2b7; --grid: #34332f;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+  }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .sub { color: var(--text-secondary); margin: 0 0 14px; }
+  .sub code { font-size: 13px; }
+  .legend { display: flex; gap: 18px; align-items: center; margin: 0 0 10px;
+            color: var(--text-secondary); font-size: 13px; flex-wrap: wrap; }
+  .legend .chip { display: inline-block; width: 14px; height: 3px;
+                  border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  .panels { display: flex; gap: 28px; flex-wrap: wrap; }
+  .panel { flex: 1 1 380px; max-width: 640px; }
+  .panel h2 { font-size: 13px; font-weight: 600; color: var(--text-secondary);
+              margin: 0 0 4px; letter-spacing: .3px; }
+  svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .gridline { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--grid); stroke-width: 1; }
+  .ticktext { fill: var(--text-secondary); font-size: 11px; }
+  .axistitle { fill: var(--text-secondary); font-size: 12px; }
+  .line { fill: none; stroke-width: 2; }
+  .dlbl { fill: var(--text-primary); font-size: 11.5px; }
+  .dlbl-chip { stroke-width: 3; }
+  .crosshair { stroke: var(--text-secondary); stroke-dasharray: 3 3;
+               stroke-width: 1; opacity: 0; pointer-events: none; }
+  .hoverdot { opacity: 0; pointer-events: none; stroke: var(--surface-1); stroke-width: 2; }
+  .tip { position: fixed; pointer-events: none; background: var(--surface-1);
+         color: var(--text-primary); border: 1px solid var(--grid);
+         border-radius: 8px; padding: 7px 10px; font-size: 12.5px;
+         box-shadow: 0 2px 10px rgba(0,0,0,.18); opacity: 0; z-index: 5; }
+  .tip .chip { display: inline-block; width: 10px; height: 10px;
+               border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .tip b { font-variant-numeric: tabular-nums; }
+  .note { color: var(--text-secondary); font-size: 12.5px; max-width: 72ch;
+          margin-top: 16px; }
+  details { margin-top: 14px; color: var(--text-secondary); }
+  details table { border-collapse: collapse; font-size: 12.5px; margin-top: 8px;
+                  font-variant-numeric: tabular-nums; }
+  details th, details td { border: 1px solid var(--grid); padding: 3px 9px;
+                           text-align: right; color: var(--text-primary); }
+  details th { color: var(--text-secondary); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <h1>Weighted-bias edge weight — how much a win is worth</h1>
+  <p class="sub">weight <code>w = 1 + x·|T_A − T_B| / (10·G)</code>, team A always
+    wins every game (T_A = 10·G); the x-axis is the opponent's goal total T_B.</p>
+  <div class="legend" id="legend"></div>
+  <div class="panels">
+    <div class="panel"><h2>2-game match &nbsp;(T_A = 20)</h2><div id="p0"></div></div>
+    <div class="panel"><h2>3-game match &nbsp;(T_A = 30)</h2><div id="p1"></div></div>
+  </div>
+  <p class="note">Reading it: a shutout (T_B = 0) is worth the full <code>1 + x</code>;
+    the weight falls linearly to just above the base credit 1 as the opponent keeps up.
+    The slope is what x controls — at x = 1 domination barely matters, at x = 8 a sweep
+    counts nearly nine times a nail-biter. N.B. the right panel is partly theoretical:
+    in a real best-of-three a 3-game winner has conceded a game, so T_A ≤ 29 and
+    T_B ≥ 10 — real matches live on the right half of that panel.</p>
+  <details><summary>Data table</summary><div id="tbl"></div></details>
+  <div class="tip" id="tip"></div>
+</div>
+<script>
+'use strict';
+const XS = [1, 4, 8];
+const COLS = ['var(--series-1)', 'var(--series-2)', 'var(--series-3)'];
+const PANELS = [
+  { games: 2, ta: 20, bmax: 18 },
+  { games: 3, ta: 30, bmax: 27 },
+];
+const W = 560, H = 380, ML = 46, MR = 64, MT = 12, MB = 44;
+const YMAX = 9.4, YMIN = 0.8;
+const weight = (x, g, b) => 1 + x * (10 * g - b) / (10 * g);
+const NS = 'http://www.w3.org/2000/svg';
+const el = (t, at) => { const e = document.createElementNS(NS, t);
+  for (const k in at) e.setAttribute(k, at[k]); return e; };
+
+// legend (identity never color-alone: chip + text token)
+XS.forEach((x, i) => {
+  const s = document.createElement('span');
+  s.innerHTML = '<span class="chip" style="background:' + COLS[i] + '"></span>x = ' + x;
+  document.getElementById('legend').appendChild(s);
+});
+
+const tip = document.getElementById('tip');
+PANELS.forEach((P, pi) => {
+  const svg = el('svg', { viewBox: `0 0 ${W} ${H}` });
+  const X = b => ML + (W - ML - MR) * b / P.bmax;
+  const Y = w => MT + (H - MT - MB) * (YMAX - w) / (YMAX - YMIN);
+  for (let w = 1; w <= 9; w += 2) {           // recessive horizontal grid
+    svg.appendChild(el('line', { x1: ML, y1: Y(w), x2: W - MR, y2: Y(w), class: 'gridline' }));
+    const t = el('text', { x: ML - 8, y: Y(w) + 4, 'text-anchor': 'end', class: 'ticktext' });
+    t.textContent = w; svg.appendChild(t);
+  }
+  svg.appendChild(el('line', { x1: ML, y1: Y(YMIN), x2: W - MR, y2: Y(YMIN), class: 'axis' }));
+  const step = P.bmax === 18 ? 3 : 3;
+  for (let b = 0; b <= P.bmax; b += step) {
+    const t = el('text', { x: X(b), y: H - MB + 18, 'text-anchor': 'middle', class: 'ticktext' });
+    t.textContent = b; svg.appendChild(t);
+  }
+  const xt = el('text', { x: (ML + W - MR) / 2, y: H - 6, 'text-anchor': 'middle', class: 'axistitle' });
+  xt.textContent = "opponent's goal total  T_B"; svg.appendChild(xt);
+  const yt = el('text', { x: 12, y: MT + 4, class: 'axistitle' });
+  yt.textContent = 'w'; svg.appendChild(yt);
+
+  XS.forEach((x, i) => {                       // 2px lines, fixed hue order
+    const pts = [];
+    for (let b = 0; b <= P.bmax; b++) pts.push(X(b) + ',' + Y(weight(x, P.games, b)));
+    svg.appendChild(el('polyline', { points: pts.join(' '), class: 'line',
+                                     stroke: COLS[i] }));
+    // selective direct label at the line's right end (text token + chip)
+    const ly = Y(weight(x, P.games, P.bmax));
+    svg.appendChild(el('line', { x1: W - MR + 4, y1: ly, x2: W - MR + 16, y2: ly,
+                                 stroke: COLS[i], class: 'dlbl-chip' }));
+    const dl = el('text', { x: W - MR + 20, y: ly + 4, class: 'dlbl' });
+    dl.textContent = 'x=' + x; svg.appendChild(dl);
+  });
+
+  // hover layer: crosshair + shared tooltip, hit target = whole plot area
+  const cross = el('line', { y1: MT, y2: H - MB, class: 'crosshair' });
+  svg.appendChild(cross);
+  const dots = XS.map((x, i) => { const d = el('circle', { r: 4.5, fill: COLS[i],
+    class: 'hoverdot' }); svg.appendChild(d); return d; });
+  const hit = el('rect', { x: ML, y: MT, width: W - ML - MR, height: H - MT - MB,
+                           fill: 'transparent' });
+  svg.appendChild(hit);
+  hit.addEventListener('mousemove', ev => {
+    const r = svg.getBoundingClientRect();
+    const fx = (ev.clientX - r.left) / r.width * W;
+    const b = Math.max(0, Math.min(P.bmax, Math.round((fx - ML) / (W - ML - MR) * P.bmax)));
+    cross.setAttribute('x1', X(b)); cross.setAttribute('x2', X(b));
+    cross.style.opacity = 1;
+    let html = '<div style="color:var(--text-secondary)">T_B = ' + b +
+               ' &nbsp;(' + P.games + ' games)</div>';
+    XS.forEach((x, i) => {
+      const w = weight(x, P.games, b);
+      dots[i].setAttribute('cx', X(b)); dots[i].setAttribute('cy', Y(w));
+      dots[i].style.opacity = 1;
+      html += '<div><span class="chip" style="background:' + COLS[i] + '"></span>' +
+              'x = ' + x + ': <b>w = ' + w.toFixed(2) + '</b></div>';
+    });
+    tip.innerHTML = html;
+    tip.style.opacity = 1;
+    tip.style.left = Math.min(ev.clientX + 14, innerWidth - 190) + 'px';
+    tip.style.top = (ev.clientY + 12) + 'px';
+  });
+  hit.addEventListener('mouseleave', () => {
+    cross.style.opacity = 0; tip.style.opacity = 0;
+    dots.forEach(d => d.style.opacity = 0);
+  });
+  document.getElementById('p' + pi).appendChild(svg);
+});
+
+// table view (accessibility fallback)
+let th = '<table><tr><th>T_B</th>';
+PANELS.forEach(P => XS.forEach(x => th += '<th>G=' + P.games + ', x=' + x + '</th>'));
+th += '</tr>';
+for (let b = 0; b <= 27; b += 3) {
+  th += '<tr><td>' + b + '</td>';
+  PANELS.forEach(P => XS.forEach(x => {
+    th += '<td>' + (b <= P.bmax ? weight(x, P.games, b).toFixed(2) : '—') + '</td>';
+  }));
+  th += '</tr>';
+}
+document.getElementById('tbl').innerHTML = th + '</table>';
+</script>
+</body>
+</html>

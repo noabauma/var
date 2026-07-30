@@ -2,8 +2,7 @@
 
 Faithful to the code in this folder (`page_rank_biliardino_algorithm.py`,
 `page_rank_biliardino_algorithm_bias.py`) and to the weighted matrix built
-by the scoreboard. Open this file with VS Code's Markdown preview
-(`Ctrl+Shift+V`) or on GitHub to see the formulas rendered.
+by the scoreboard.
 
 ## Setup: the win matrix
 

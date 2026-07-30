@@ -43,13 +43,12 @@
             color: var(--text-secondary); font-size: 13px; flex-wrap: wrap; }
   .legend .chip { display: inline-block; width: 14px; height: 3px;
                   border-radius: 2px; vertical-align: middle; margin-right: 6px; }
-  .panels { display: flex; gap: 28px; flex-wrap: wrap; }
-  .panel { flex: 1 1 380px; max-width: 640px; }
-  .panel h2 { font-size: 13px; font-weight: 600; color: var(--text-secondary);
-              margin: 0 0 4px; letter-spacing: .3px; }
+  .panel { max-width: 780px; }
   svg { width: 100%; height: auto; display: block; overflow: visible; }
   .gridline { stroke: var(--grid); stroke-width: 1; }
   .axis { stroke: var(--grid); stroke-width: 1; }
+  .baseline { stroke: var(--text-secondary); stroke-width: 1.2;
+              stroke-dasharray: 5 5; }
   .ticktext { fill: var(--text-secondary); font-size: 11px; }
   .axistitle { fill: var(--text-secondary); font-size: 12px; }
   .line { fill: none; stroke-width: 2; }
@@ -78,119 +77,111 @@
 <body>
 <div class="viz-root">
   <h1>Weighted-bias edge weight — how much a win is worth</h1>
-  <p class="sub">weight <code>w = |T_A − T_B| / (10·G)</code>, team A always
-    wins every game (T_A = 10·G); the x-axis is the opponent's goal total T_B.</p>
+  <p class="sub">weight <code>w = 1 + x·s</code> with the goal-difference share
+    <code>s = |T_A − T_B| / (10·G)</code> — s already folds the game count away
+    (a 2-game 20–8 and a 3-game 30–12 both sit at s&nbsp;=&nbsp;0.6).</p>
   <div class="legend" id="legend"></div>
-  <div class="panels">
-    <div class="panel" style="max-width:760px"><div id="p0"></div></div>
-  </div>
-  <p class="note">Reading it: a shutout (T_B = 0) is worth a full unit of edge
-    weight; the weight falls linearly to 0 as the opponent catches up — dominant
-    wins carry rank flow, nail-biters barely any, totals-ties none. There is no
-    hyperparameter: a global factor would cancel in the PageRank normalization.
-    N.B. the 3-game line is partly theoretical: in a real best-of-three a 3-game
-    winner has conceded a game, so T_A ≤ 29 and T_B ≥ 10.</p>
+  <div class="panel"><div id="p0"></div></div>
+  <p class="note">Reading it: the win itself always earns the base credit 1
+    (the dashed x&nbsp;=&nbsp;0 line — the plain binary matrix); the extra part
+    x·s rewards domination, fanning out to 1&nbsp;+&nbsp;x at a full sweep.
+    Doc example&nbsp;1 (10-4, 9-10, 10-3) lands at s&nbsp;=&nbsp;0.4.</p>
   <details><summary>Data table</summary><div id="tbl"></div></details>
   <div class="tip" id="tip"></div>
 </div>
 <script>
 'use strict';
-const GS = [ { games: 2, ta: 20, bmax: 18 }, { games: 3, ta: 30, bmax: 27 } ];
-const COLS = ['var(--series-1)', 'var(--series-2)'];
-const PANELS = [ { bmax: 27 } ];
-const W = 560, H = 380, ML = 46, MR = 64, MT = 12, MB = 44;
-const YMAX = 1.06, YMIN = 0;
-const weight = (g, b) => (10 * g - b) / (10 * g);
+const XS = [1, 4, 8];
+const COLS = ['var(--series-1)', 'var(--series-2)', 'var(--series-3)'];
+const W = 620, H = 400, ML = 46, MR = 60, MT = 12, MB = 44;
+const YMAX = 9.5, YMIN = 0.5;
+const weight = (x, s) => 1 + x * s;
 const NS = 'http://www.w3.org/2000/svg';
 const el = (t, at) => { const e = document.createElementNS(NS, t);
   for (const k in at) e.setAttribute(k, at[k]); return e; };
 
 // legend (identity never color-alone: chip + text token)
-GS.forEach((g, i) => {
+XS.forEach((x, i) => {
   const s = document.createElement('span');
-  s.innerHTML = '<span class="chip" style="background:' + COLS[i] + '"></span>' +
-                g.games + '-game match (T_A = ' + g.ta + ')';
+  s.innerHTML = '<span class="chip" style="background:' + COLS[i] + '"></span>x = ' + x;
   document.getElementById('legend').appendChild(s);
 });
 
 const tip = document.getElementById('tip');
-PANELS.forEach((P, pi) => {
-  const svg = el('svg', { viewBox: `0 0 ${W} ${H}` });
-  const X = b => ML + (W - ML - MR) * b / P.bmax;
-  const Y = w => MT + (H - MT - MB) * (YMAX - w) / (YMAX - YMIN);
-  for (let w = 0; w <= 1.001; w += 0.25) {           // recessive horizontal grid
-    svg.appendChild(el('line', { x1: ML, y1: Y(w), x2: W - MR, y2: Y(w), class: 'gridline' }));
-    const t = el('text', { x: ML - 8, y: Y(w) + 4, 'text-anchor': 'end', class: 'ticktext' });
-    t.textContent = w.toFixed(2); svg.appendChild(t);
-  }
-  svg.appendChild(el('line', { x1: ML, y1: Y(YMIN), x2: W - MR, y2: Y(YMIN), class: 'axis' }));
-  const step = 3;
-  for (let b = 0; b <= P.bmax; b += step) {
-    const t = el('text', { x: X(b), y: H - MB + 18, 'text-anchor': 'middle', class: 'ticktext' });
-    t.textContent = b; svg.appendChild(t);
-  }
-  const xt = el('text', { x: (ML + W - MR) / 2, y: H - 6, 'text-anchor': 'middle', class: 'axistitle' });
-  xt.textContent = "opponent's goal total  T_B"; svg.appendChild(xt);
-  const yt = el('text', { x: 12, y: MT + 4, class: 'axistitle' });
-  yt.textContent = 'w'; svg.appendChild(yt);
+const svg = el('svg', { viewBox: `0 0 ${W} ${H}` });
+const X = s => ML + (W - ML - MR) * s;
+const Y = w => MT + (H - MT - MB) * (YMAX - w) / (YMAX - YMIN);
+for (let w = 1; w <= 9; w += 2) {                 // recessive horizontal grid
+  svg.appendChild(el('line', { x1: ML, y1: Y(w), x2: W - MR, y2: Y(w), class: 'gridline' }));
+  const t = el('text', { x: ML - 8, y: Y(w) + 4, 'text-anchor': 'end', class: 'ticktext' });
+  t.textContent = w; svg.appendChild(t);
+}
+svg.appendChild(el('line', { x1: ML, y1: Y(YMIN), x2: W - MR, y2: Y(YMIN), class: 'axis' }));
+for (let s = 0; s <= 1.001; s += 0.2) {
+  const t = el('text', { x: X(s), y: H - MB + 18, 'text-anchor': 'middle', class: 'ticktext' });
+  t.textContent = s.toFixed(1); svg.appendChild(t);
+}
+const xt = el('text', { x: (ML + W - MR) / 2, y: H - 6, 'text-anchor': 'middle', class: 'axistitle' });
+xt.textContent = 'goal-difference share  s   (0 = totals tied … 1 = full sweep)';
+svg.appendChild(xt);
+const yt = el('text', { x: 12, y: MT + 4, class: 'axistitle' });
+yt.textContent = 'w'; svg.appendChild(yt);
 
-  GS.forEach((g, i) => {                       // 2px lines, fixed hue order
-    const pts = [];
-    for (let b = 0; b <= g.bmax; b++) pts.push(X(b) + ',' + Y(weight(g.games, b)));
-    svg.appendChild(el('polyline', { points: pts.join(' '), class: 'line',
-                                     stroke: COLS[i] }));
-    // selective direct label at the line's right end (text token + chip)
-    const lx = X(g.bmax), ly = Y(weight(g.games, g.bmax));
-    svg.appendChild(el('line', { x1: lx + 5, y1: ly, x2: lx + 17, y2: ly,
-                                 stroke: COLS[i], class: 'dlbl-chip' }));
-    const dl = el('text', { x: lx + 21, y: ly + 4, class: 'dlbl' });
-    dl.textContent = 'G=' + g.games; svg.appendChild(dl);
-  });
+// x = 0 baseline: the plain binary matrix
+svg.appendChild(el('line', { x1: ML, y1: Y(1), x2: W - MR, y2: Y(1), class: 'baseline' }));
+const bl = el('text', { x: ML + 6, y: Y(1) + 15, class: 'ticktext' });
+bl.textContent = 'x = 0  (base credit only)'; svg.appendChild(bl);
 
-  // hover layer: crosshair + shared tooltip, hit target = whole plot area
-  const cross = el('line', { y1: MT, y2: H - MB, class: 'crosshair' });
-  svg.appendChild(cross);
-  const dots = GS.map((g, i) => { const d = el('circle', { r: 4.5, fill: COLS[i],
-    class: 'hoverdot' }); svg.appendChild(d); return d; });
-  const hit = el('rect', { x: ML, y: MT, width: W - ML - MR, height: H - MT - MB,
-                           fill: 'transparent' });
-  svg.appendChild(hit);
-  hit.addEventListener('mousemove', ev => {
-    const r = svg.getBoundingClientRect();
-    const fx = (ev.clientX - r.left) / r.width * W;
-    const b = Math.max(0, Math.min(P.bmax, Math.round((fx - ML) / (W - ML - MR) * P.bmax)));
-    cross.setAttribute('x1', X(b)); cross.setAttribute('x2', X(b));
-    cross.style.opacity = 1;
-    let html = '<div style="color:var(--text-secondary)">T_B = ' + b + '</div>';
-    GS.forEach((g, i) => {
-      if (b > g.bmax) { dots[i].style.opacity = 0; return; }
-      const w = weight(g.games, b);
-      dots[i].setAttribute('cx', X(b)); dots[i].setAttribute('cy', Y(w));
-      dots[i].style.opacity = 1;
-      html += '<div><span class="chip" style="background:' + COLS[i] + '"></span>' +
-              g.games + ' games: <b>w = ' + w.toFixed(3) + '</b></div>';
-    });
-    tip.innerHTML = html;
-    tip.style.opacity = 1;
-    tip.style.left = Math.min(ev.clientX + 14, innerWidth - 190) + 'px';
-    tip.style.top = (ev.clientY + 12) + 'px';
-  });
-  hit.addEventListener('mouseleave', () => {
-    cross.style.opacity = 0; tip.style.opacity = 0;
-    dots.forEach(d => d.style.opacity = 0);
-  });
-  document.getElementById('p' + pi).appendChild(svg);
+XS.forEach((x, i) => {                            // 2px lines, fixed hue order
+  svg.appendChild(el('polyline', { class: 'line', stroke: COLS[i],
+    points: X(0) + ',' + Y(1) + ' ' + X(1) + ',' + Y(1 + x) }));
+  const ly = Y(1 + x);                            // direct label at the end
+  svg.appendChild(el('line', { x1: X(1) + 5, y1: ly, x2: X(1) + 17, y2: ly,
+                               stroke: COLS[i], class: 'dlbl-chip' }));
+  const dl = el('text', { x: X(1) + 21, y: ly + 4, class: 'dlbl' });
+  dl.textContent = 'x=' + x; svg.appendChild(dl);
 });
 
-// table view (accessibility fallback)
-let th = '<table><tr><th>T_B</th>';
-GS.forEach(g => th += '<th>G=' + g.games + '</th>');
-th += '</tr>';
-for (let b = 0; b <= 27; b += 3) {
-  th += '<tr><td>' + b + '</td>';
-  GS.forEach(g => {
-    th += '<td>' + (b <= g.bmax ? weight(g.games, b).toFixed(3) : '—') + '</td>';
+// hover layer: crosshair + shared tooltip over the whole plot area
+const cross = el('line', { y1: MT, y2: H - MB, class: 'crosshair' });
+svg.appendChild(cross);
+const dots = XS.map((x, i) => { const d = el('circle', { r: 4.5, fill: COLS[i],
+  class: 'hoverdot' }); svg.appendChild(d); return d; });
+const hit = el('rect', { x: ML, y: MT, width: W - ML - MR, height: H - MT - MB,
+                         fill: 'transparent' });
+svg.appendChild(hit);
+hit.addEventListener('mousemove', ev => {
+  const r = svg.getBoundingClientRect();
+  const fx = (ev.clientX - r.left) / r.width * W;
+  const s = Math.max(0, Math.min(1, (fx - ML) / (W - ML - MR)));
+  cross.setAttribute('x1', X(s)); cross.setAttribute('x2', X(s));
+  cross.style.opacity = 1;
+  let html = '<div style="color:var(--text-secondary)">s = ' + s.toFixed(2) + '</div>';
+  XS.forEach((x, i) => {
+    const w = weight(x, s);
+    dots[i].setAttribute('cx', X(s)); dots[i].setAttribute('cy', Y(w));
+    dots[i].style.opacity = 1;
+    html += '<div><span class="chip" style="background:' + COLS[i] + '"></span>' +
+            'x = ' + x + ': <b>w = ' + w.toFixed(2) + '</b></div>';
   });
+  tip.innerHTML = html;
+  tip.style.opacity = 1;
+  tip.style.left = Math.min(ev.clientX + 14, innerWidth - 180) + 'px';
+  tip.style.top = (ev.clientY + 12) + 'px';
+});
+hit.addEventListener('mouseleave', () => {
+  cross.style.opacity = 0; tip.style.opacity = 0;
+  dots.forEach(d => d.style.opacity = 0);
+});
+document.getElementById('p0').appendChild(svg);
+
+// table view (accessibility fallback)
+let th = '<table><tr><th>s</th>';
+XS.forEach(x => th += '<th>x=' + x + '</th>');
+th += '</tr>';
+for (let s = 0; s <= 1.001; s += 0.1) {
+  th += '<tr><td>' + s.toFixed(1) + '</td>';
+  XS.forEach(x => th += '<td>' + weight(x, s).toFixed(2) + '</td>');
   th += '</tr>';
 }
 document.getElementById('tbl').innerHTML = th + '</table>';

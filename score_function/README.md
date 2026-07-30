@@ -23,7 +23,7 @@ defeated to the victor.
 everyone who beat it. With column sums $c_j = \sum_i M_{ij}$ (the losses
 of team $j$):
 
-$$\widehat{M}_{ij} = \frac{M_{ij}}{\max(c_j,\,1)}$$
+$$\widehat{M}_{ij} = \frac{M_{ij}}{\max(c_j,1)}$$
 
 The $\max(\cdot,1)$ is the dangling-node guard: an **undefeated** team has
 $c_j = 0$ and its column simply stays all-zero (see the deviations below).
@@ -60,7 +60,49 @@ $$v_i \;=\; \underbrace{\frac{1-d}{n}}_{\text{teleport floor}}
 2. No per-iteration renormalization — unnecessary, since the teleport
    term keeps $v$ positive and the contraction guarantees convergence.
 
-## 2. Recursive deletion (the fully-connected-graph approach)
+## 2. Bias PageRank (the live scoreboard's default)
+
+Identical flow structure, but the flat teleport $\mathbb{1}/n$ is
+replaced by a **participation baseline**: with games played
+$g_i$ as above (computed on the *raw* matrix),
+
+$$p_i = \frac{g_i}{\sum_k g_k},$$
+
+the iteration becomes
+
+$$v^{(k+1)} = d\,\widehat{M}\,v^{(k)} + (1-d)\,p .$$
+
+The teleport floor is no longer equal for everyone — it is proportional
+to how much a team has played. Sitting out earns nothing; playing (even
+losing) earns baseline credit. This is why the leave-one-out match
+impacts often show a *positive* delta for the loser: the participation
+credit of one more match can outweigh the rank flow lost.
+
+## 3. Weighted bias PageRank
+
+Same algorithm as §3, run on a **goal-difference-weighted matrix** $W$
+instead of the binary $M$. A match between $A$ and $B$ with game totals
+$T_A, T_B$ over $G$ games adds, to the winner's row,
+
+$$W_{\text{winner},\,\text{loser}} \mathrel{+}= 1 + x\,\frac{\lvert T_A - T_B\rvert}{10\,G},
+\qquad x \in [1, 10).$$
+
+The constant $1$ is the base credit for the win itself; the second term
+rewards domination, tuned by the hyperparameter $x$. The base credit is
+essential: a *pure* scaling weight $x\,\lvert T_A-T_B\rvert/(10G)$ would
+cancel entirely, because both the column normalization
+$\widehat{W}_{ij} = W_{ij}/\max(c_j,1)$ **and** the participation
+baseline $p$ are ratios — multiplying every edge by the same constant
+changes neither. Only the *relative* spread between narrow and dominant
+wins survives, which is exactly what $x$ controls: at small $x$ the
+ranking hugs plain bias PageRank; at large $x$, sweeping 10–0 outweighs
+grinding out 10–9s.
+
+A match with no recorded game scores contributes the base credit $1$
+only. Matches, $d$ and $x$ are wired through `compute_scores.py`; the
+two algorithm files remain the single source of truth for the math.
+
+## BONUS: Recursive deletion (the fully-connected-graph approach)
 
 PageRank comparisons are only fair on a well-connected graph — a team
 with a single lucky win distorts the flow. So before the *final*
@@ -94,45 +136,3 @@ M_{i,\cdot} \leftarrow 0,\qquad M_{\cdot,i} \leftarrow 0,$$
 stop target would be $g_{\max} = (n - D) - 1$ (nobody plays themselves);
 the implementation tests $g_{\max} = n - D$, which is only reachable when
 at least one pair has played more than once.
-
-## 3. Bias PageRank (the live scoreboard's default)
-
-Identical flow structure, but the flat teleport $\mathbb{1}/n$ is
-replaced by a **participation baseline**: with games played
-$g_i$ as above (computed on the *raw* matrix),
-
-$$p_i = \frac{g_i}{\sum_k g_k},$$
-
-the iteration becomes
-
-$$v^{(k+1)} = d\,\widehat{M}\,v^{(k)} + (1-d)\,p .$$
-
-The teleport floor is no longer equal for everyone — it is proportional
-to how much a team has played. Sitting out earns nothing; playing (even
-losing) earns baseline credit. This is why the leave-one-out match
-impacts often show a *positive* delta for the loser: the participation
-credit of one more match can outweigh the rank flow lost.
-
-## 4. Weighted bias PageRank
-
-Same algorithm as §3, run on a **goal-difference-weighted matrix** $W$
-instead of the binary $M$. A match between $A$ and $B$ with game totals
-$T_A, T_B$ over $G$ games adds, to the winner's row,
-
-$$W_{\text{winner},\,\text{loser}} \mathrel{+}= 1 + x\,\frac{\lvert T_A - T_B\rvert}{10\,G},
-\qquad x \in [1, 10).$$
-
-The constant $1$ is the base credit for the win itself; the second term
-rewards domination, tuned by the hyperparameter $x$. The base credit is
-essential: a *pure* scaling weight $x\,\lvert T_A-T_B\rvert/(10G)$ would
-cancel entirely, because both the column normalization
-$\widehat{W}_{ij} = W_{ij}/\max(c_j,1)$ **and** the participation
-baseline $p$ are ratios — multiplying every edge by the same constant
-changes neither. Only the *relative* spread between narrow and dominant
-wins survives, which is exactly what $x$ controls: at small $x$ the
-ranking hugs plain bias PageRank; at large $x$, sweeping 10–0 outweighs
-grinding out 10–9s.
-
-A match with no recorded game scores contributes the base credit $1$
-only. Matches, $d$ and $x$ are wired through `compute_scores.py`; the
-two algorithm files remain the single source of truth for the math.

@@ -367,6 +367,7 @@ struct Shared {
     MessageQueue msgs;
     ScoreBoard *scores = nullptr; // web scoreboard (null = disabled)
     BetBoard *bets = nullptr;     // virtual betting (null = disabled)
+    struct KnockoutBoard *ko = nullptr; // top-8 bracket (null = disabled)
     Transcoder *xcode = nullptr;  // background MP4 conversion (null = off)
 
     // live-match state, published by the CV referee (referee/referee.py)
@@ -2073,6 +2074,26 @@ struct ScoreBoard {
         return j + "]}";
     }
 
+    // current top-k team names by bias score (ties broken by name), for
+    // seeding the knockout bracket; empty on scorer errors
+    std::vector<std::string> top_names(size_t k) {
+        std::lock_guard<std::mutex> lk(m);
+        const size_t n = teams.size();
+        if (cache_bias.size() != n || cache_plain.size() != n ||
+            cache_wbias.size() != n) recompute_locked();
+        if (!cache_err.empty() || cache_bias.size() != n || n < k) return {};
+        std::vector<size_t> idx(n);
+        for (size_t i = 0; i < n; i++) idx[i] = i;
+        std::sort(idx.begin(), idx.end(), [&](size_t x, size_t y) {
+            if (cache_bias[x] != cache_bias[y])
+                return cache_bias[x] > cache_bias[y];
+            return teams[x] < teams[y];
+        });
+        std::vector<std::string> out;
+        for (size_t i = 0; i < k; i++) out.push_back(teams[idx[i]]);
+        return out;
+    }
+
     // Leave-one-out impact of every match on the BIAS scores: for each
     // match, the bias PageRank is recomputed WITHOUT it — dw is what the
     // win adds to the winner and dl what the loss does to the loser,
@@ -2250,6 +2271,161 @@ struct ScoreBoard {
 
 // ------------------------------------------------------------ virtual bets
 // Pure-virtual betting for spectators (and brave players): anyone opens
+// --------------------------------------------------------------- knockout
+// The top-8 knockout stage. Results are entered manually with the same
+// best-of-three game-score syntax as group matches and persist to
+// <out-dir>/knockout.tsv (atomic tmp+rename). Seeding is the LIVE top 8
+// of the bias ranking until the first result is entered — that freezes
+// the seeds into the file, so later group-stage edits can never reshuffle
+// a bracket that is already being played. Stages: qf1..qf4, sf1, sf2, f.
+struct KnockoutBoard {
+    struct Entry {
+        std::string stage, a, b, w, games;
+    };
+    std::mutex m;
+    std::string file;
+    std::vector<std::string> seeds; // frozen top 8; empty = still live
+    std::vector<Entry> entries;
+
+    static bool stage_ok(const std::string &s) {
+        static const char *k[] = {"qf1", "qf2", "qf3", "qf4", "sf1", "sf2", "f"};
+        for (const char *x : k)
+            if (s == x) return true;
+        return false;
+    }
+
+    void load() {
+        std::lock_guard<std::mutex> lk(m);
+        FILE *fh = std::fopen(file.c_str(), "r");
+        if (!fh) return;
+        char line[512];
+        while (std::fgets(line, sizeof line, fh)) {
+            std::string s(line);
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+                s.pop_back();
+            std::vector<std::string> f;
+            size_t pos = 0;
+            while (pos <= s.size()) {
+                size_t tab = s.find('\t', pos);
+                f.push_back(s.substr(pos, tab == std::string::npos
+                                              ? tab : tab - pos));
+                if (tab == std::string::npos) break;
+                pos = tab + 1;
+            }
+            if (f.size() == 9 && f[0] == "seeds") {
+                seeds.assign(f.begin() + 1, f.end());
+            } else if (f.size() == 6 && f[0] == "ko" && stage_ok(f[1])) {
+                entries.push_back({f[1], f[2], f[3], f[5], f[4]});
+            }
+        }
+        std::fclose(fh);
+    }
+
+    bool save_locked(std::string &err) {
+        std::string tmp = file + ".tmp";
+        FILE *fh = std::fopen(tmp.c_str(), "w");
+        if (!fh) { err = errno_str("open " + tmp); return false; }
+        bool ok = true;
+        if (seeds.size() == 8) {
+            ok = std::fprintf(fh, "seeds") > 0;
+            for (const auto &s : seeds)
+                ok = ok && std::fprintf(fh, "\t%s", s.c_str()) > 0;
+            ok = ok && std::fprintf(fh, "\n") > 0;
+        }
+        for (const auto &e : entries)
+            ok = ok && std::fprintf(fh, "ko\t%s\t%s\t%s\t%s\t%s\n",
+                                    e.stage.c_str(), e.a.c_str(), e.b.c_str(),
+                                    e.games.c_str(), e.w.c_str()) > 0;
+        ok = std::fflush(fh) == 0 && ok && !ferror(fh);
+        std::fclose(fh);
+        if (!ok || rename(tmp.c_str(), file.c_str()) != 0) {
+            err = errno_str("write " + file);
+            unlink(tmp.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    // live_top8: the current bias ranking (used until seeds freeze)
+    std::string json(const std::vector<std::string> &live_top8) {
+        std::lock_guard<std::mutex> lk(m);
+        const bool frozen = seeds.size() == 8;
+        const auto &sd = frozen ? seeds : live_top8;
+        std::string j = std::string("{\"ok\":true,\"frozen\":") +
+                        (frozen ? "true" : "false") + ",\"seeds\":[";
+        for (size_t i = 0; i < sd.size(); i++) {
+            if (i) j += ',';
+            j += '"';
+            json_escape(j, sd[i]);
+            j += '"';
+        }
+        j += "],\"matches\":{";
+        for (size_t i = 0; i < entries.size(); i++) {
+            const Entry &e = entries[i];
+            if (i) j += ',';
+            j += '"' + e.stage + "\":{\"a\":\"";
+            json_escape(j, e.a);
+            j += "\",\"b\":\"";
+            json_escape(j, e.b);
+            j += "\",\"games\":\"";
+            json_escape(j, e.games);
+            j += "\",\"w\":\"";
+            json_escape(j, e.w);
+            j += "\"}";
+        }
+        return j + "}}";
+    }
+
+    bool add(const std::string &stage, const std::string &a_raw,
+             const std::string &b_raw, const std::string &games_raw,
+             const std::vector<std::string> &live_top8, std::string &err) {
+        if (!stage_ok(stage)) { err = "unknown knockout stage"; return false; }
+        std::string an = ScoreBoard::sanitize_name(a_raw);
+        std::string bn = ScoreBoard::sanitize_name(b_raw);
+        if (an.empty() || bn.empty() || an == bn) {
+            err = "two distinct team names are required";
+            return false;
+        }
+        std::vector<ScoreBoard::Game> gs;
+        if (!ScoreBoard::parse_games(games_raw, gs, err)) return false;
+        int wa, wb;
+        if (!ScoreBoard::bo3_ok(gs, wa, wb, err)) return false;
+        std::string g;
+        char buf[16];
+        for (const auto &gm : gs) {
+            std::snprintf(buf, sizeof buf, "%s%d-%d", g.empty() ? "" : ",",
+                          gm.a, gm.b);
+            g += buf;
+        }
+        std::lock_guard<std::mutex> lk(m);
+        if (seeds.size() != 8) {
+            if (live_top8.size() != 8) {
+                err = "need at least 8 ranked teams to start the knockout";
+                return false;
+            }
+            seeds = live_top8; // the first result freezes the seeding
+        }
+        Entry e{stage, an, bn, wa > wb ? an : bn, g};
+        bool replaced = false;
+        for (auto &x : entries)
+            if (x.stage == stage) { x = e; replaced = true; }
+        if (!replaced) entries.push_back(e);
+        return save_locked(err);
+    }
+
+    bool del(const std::string &stage, std::string &err) {
+        std::lock_guard<std::mutex> lk(m);
+        for (size_t i = 0; i < entries.size(); i++)
+            if (entries[i].stage == stage) {
+                entries.erase(entries.begin() + i);
+                if (entries.empty()) seeds.clear(); // bracket reset: go live
+                return save_locked(err);
+            }
+        err = "no result stored for that stage";
+        return false;
+    }
+};
+
 // betting on the match about to be played, picks a team at odds derived
 // from the bias PageRank standings (locked at bet time), and the bet
 // settles automatically when the result is entered on the scoreboard.
@@ -2551,6 +2727,28 @@ button:disabled{opacity:.4;cursor:default}
 #tb tr.qual td:first-child{border-left:3px solid #22c55e;color:#22c55e;font-weight:700}
 #tb tr.cutline td{border-bottom:2px dashed #e5c07b}
 #konote{font-size:12px;color:#8b96a5;margin-top:8px;line-height:1.5}
+#kosec{width:calc(100vw - 28px);max-width:1500px;position:relative;left:50%;transform:translateX(-50%);margin:20px 0 4px;padding:0 8px;box-sizing:border-box}
+#kosec h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:2px 0 4px}
+#kohint{color:#5c6672;font-size:12px;margin-bottom:10px}
+#kotree{display:flex;gap:30px;align-items:stretch}
+.kocol{display:flex;flex-direction:column;justify-content:space-around;gap:10px;flex:1;min-width:0}
+.kocol h3{font-size:11px;color:#5c6672;text-transform:uppercase;letter-spacing:.5px;margin:0;text-align:center}
+.kmatch{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:6px 10px;position:relative;cursor:pointer}
+.kmatch:hover{border-color:#3b82f6}
+.kmatch.pending{border-style:dashed;background:#10151b}
+.krow{display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-size:14px;min-width:0}
+.krow .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dfe6ee}
+.krow .nm.tbd{color:#5c6672;font-style:italic}
+.krow.win .nm{color:#22c55e;font-weight:700}
+.krow .sc{color:#8b96a5;font-variant-numeric:tabular-nums;white-space:nowrap}
+.krow.win .sc{color:#22c55e;font-weight:700}
+.kseed{display:inline-block;min-width:16px;text-align:center;background:#1c2530;border-radius:5px;font-size:11px;color:#8b96a5;margin-right:7px;padding:0 3px}
+.kdel{position:absolute;top:3px;right:5px;opacity:.35;background:none;padding:0 3px;font-size:11px}
+.kdel:hover{opacity:1}
+.kchamp{display:flex;flex-direction:column;justify-content:center;align-items:center;gap:6px;flex:.7}
+.kchamp .cup{font-size:36px}
+.kchamp .nm{font-weight:700;font-size:16px;color:#e5c07b;text-align:center;overflow-wrap:anywhere}
+@media (max-width:900px){#kotree{flex-direction:column}.kchamp{flex:none}}
 #konote b{color:#22c55e}
 #konote .days{color:#e5c07b;font-weight:700}
 #af{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
@@ -2664,6 +2862,11 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </aside>
 <div id="wrap"><img id="cam" src="/stream" alt="live"><video id="vid" controls playsinline hidden></video><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="livematch" hidden></div><div id="goalspeed" hidden></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
 </main>
+<section id="kosec">
+<h2>&#9876;&#65039; Knockout &mdash; top 8</h2>
+<div id="kohint"></div>
+<div id="kotree"></div>
+</section>
 <footer>
 <button id="save">&#128308; Save + replay</button>
 <button id="again" disabled>&#8635; Replay last</button>
@@ -3132,7 +3335,71 @@ async function scores(){try{const s=await(await fetch('/scores')).json();
  if(S.d!==undefined&&document.activeElement!==$('dsl')&&document.activeElement!==$('dnum')){
   $('dsl').value=S.d;$('dnum').value=(+S.d).toFixed(2);} // don't fight the editing hand
  if(S.x!==undefined&&document.activeElement!==$('xnum'))$('xnum').value=S.x;
- renderTable();renderDetail();rankhist();}catch(e){}}
+ renderTable();renderDetail();rankhist();koFetch();}catch(e){}}
+let KO=null;
+async function koFetch(){try{const j=await(await fetch('/ko')).json();
+ if(j.ok){KO=j;renderKO();}}catch(e){}}
+function renderKO(){const t=$('kotree');if(!KO||!t)return;t.innerHTML='';
+ const seeds=KO.seeds||[],M=KO.matches||{};
+ $('kohint').textContent=KO.frozen
+  ?'seeding frozen since the first result · click a match to enter or edit its game scores'
+  :(seeds.length===8
+    ?'projected from the live bias ranking — teams can still move until the first result is entered, which freezes the seeding'
+    :'the bracket needs 8 ranked teams');
+ const seedNo={};seeds.forEach((n,i)=>seedNo[n]=i+1);
+ const qp=[[0,7],[3,4],[2,5],[1,6]]; // 1v8, 4v5, 3v6, 2v7
+ function postGames(stage,ta,tb,prev){
+  const g=prompt('Game scores '+ta+' vs '+tb+" (from "+ta+"'s view, e.g. 10-7, 10-3):",prev||'');
+  if(g==null||!g.trim())return;
+  fetch('/ko/add?stage='+stage+'&a='+enc(ta)+'&b='+enc(tb)+'&games='+enc(g.trim()),
+   {method:'POST'}).then(r=>r.json()).then(r=>{if(!r.ok)alert(r.error);koFetch();});}
+ function card(stage,a,b,fa,fb){
+  const e=M[stage],ta=e?e.a:a,tb=e?e.b:b;
+  const div=document.createElement('div');
+  div.className='kmatch'+(e?'':' pending');
+  let wa='',wb='';
+  if(e&&e.games){const gs=e.games.split(',').map(x=>x.split('-').map(Number));
+   wa=gs.filter(g2=>g2[0]>g2[1]).length;wb=gs.length-wa;
+   div.title=ta+' vs '+tb+': '+e.games.replace(/,/g,', ');}
+  [[ta,fa,wa],[tb,fb,wb]].forEach(([nm,feeder,sc])=>{
+   const r=document.createElement('div');
+   r.className='krow'+(e&&e.w===nm?' win':'');
+   const ns=document.createElement('span');ns.className='nm'+(nm?'':' tbd');
+   if(nm&&seedNo[nm]){const sd=document.createElement('span');sd.className='kseed';
+    sd.textContent=seedNo[nm];ns.appendChild(sd);}
+   ns.appendChild(document.createTextNode(nm||feeder));
+   const scs=document.createElement('span');scs.className='sc';
+   scs.textContent=e?sc:'';
+   r.appendChild(ns);r.appendChild(scs);div.appendChild(r);});
+  if(e){const del=document.createElement('button');del.className='kdel';
+   del.textContent='🗑';del.title='delete this knockout result';
+   del.onclick=ev=>{ev.stopPropagation();
+    if(confirm('Delete the '+stage.toUpperCase()+' result?'))
+     fetch('/ko/del?stage='+stage,{method:'POST'}).then(()=>koFetch());};
+   div.appendChild(del);
+   div.onclick=()=>postGames(stage,ta,tb,e.games.replace(/,/g,', '));}
+  else if(ta&&tb)div.onclick=()=>postGames(stage,ta,tb);
+  else div.style.cursor='default';
+  return div;}
+ const wOf=st=>M[st]?M[st].w:null;
+ const cQ=document.createElement('div');cQ.className='kocol';
+ cQ.innerHTML='<h3>Quarter-finals</h3>';
+ ['qf1','qf2','qf3','qf4'].forEach((st,i)=>{const p=qp[i];
+  cQ.appendChild(card(st,seeds[p[0]]||'',seeds[p[1]]||'',
+   'seed '+(p[0]+1),'seed '+(p[1]+1)));});
+ const cS=document.createElement('div');cS.className='kocol';
+ cS.innerHTML='<h3>Semi-finals</h3>';
+ cS.appendChild(card('sf1',wOf('qf1'),wOf('qf2'),'winner QF1','winner QF2'));
+ cS.appendChild(card('sf2',wOf('qf3'),wOf('qf4'),'winner QF3','winner QF4'));
+ const cF=document.createElement('div');cF.className='kocol';
+ cF.innerHTML='<h3>Final</h3>';
+ cF.appendChild(card('f',wOf('sf1'),wOf('sf2'),'winner SF1','winner SF2'));
+ const cC=document.createElement('div');cC.className='kchamp';
+ const cup=document.createElement('div');cup.className='cup';cup.textContent='🏆';
+ const cn=document.createElement('div');cn.className='nm';
+ cn.textContent=wOf('f')||'—';
+ cC.appendChild(cup);cC.appendChild(cn);
+ t.appendChild(cQ);t.appendChild(cS);t.appendChild(cF);t.appendChild(cC);}
 $('algb').onclick=()=>{alg='bias';renderTable();renderDetail();};
 $('algp').onclick=()=>{alg='plain';renderTable();renderDetail();};
 $('algw').onclick=()=>{alg='wbias';renderTable();renderDetail();};
@@ -3881,6 +4148,25 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
             handle_status(fd, cfg, sh, admin);
         else if (method == "GET" && route == "/scores")
             handle_scores(fd, sh);
+        else if (method == "GET" && route == "/ko" && sh->ko && sh->scores)
+            send_simple(fd, sh, "200 OK", "application/json",
+                        sh->ko->json(sh->scores->top_names(8)));
+        else if (method == "POST" && route == "/ko/add" && sh->ko && sh->scores) {
+            std::string err;
+            bool ok = sh->ko->add(query_str(path, "stage"),
+                                  query_str(path, "a"), query_str(path, "b"),
+                                  query_str(path, "games"),
+                                  sh->scores->top_names(8), err);
+            if (ok) sh->msgs.push("knockout result: " + query_str(path, "stage") +
+                                  " " + query_str(path, "a") + " vs " +
+                                  query_str(path, "b"));
+            scores_mutation(fd, sh, ok, err);
+        }
+        else if (method == "POST" && route == "/ko/del" && sh->ko) {
+            std::string err;
+            scores_mutation(fd, sh, sh->ko->del(query_str(path, "stage"), err),
+                            err);
+        }
         else if (method == "GET" && route == "/scores/impact" && sh->scores)
             send_simple(fd, sh, "200 OK", "application/json",
                         sh->scores->impact_json());
@@ -4263,6 +4549,7 @@ int main(int argc, char **argv) {
 
     ScoreBoard scores; // declared before sh: outlives the web client threads
     BetBoard bets;
+    KnockoutBoard ko;
     Transcoder xcode;
     Shared sh(cfg.max_frames(), (size_t)cfg.capture_fps);
     if (cfg.selftest == 0 && has_cmd("ffmpeg")) {
@@ -4298,6 +4585,9 @@ int main(int argc, char **argv) {
             bets.file = cfg.out_dir + "/bets.tsv";
             bets.load();
             sh.bets = &bets;
+            ko.file = cfg.out_dir + "/knockout.tsv";
+            ko.load();
+            sh.ko = &ko;
         }
     }
     std::thread cap(cfg.mjpeg_file.empty() ? v4l2_capture_thread

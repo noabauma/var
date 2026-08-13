@@ -124,6 +124,17 @@ damping-d slider (default 0.85) and the x input are visible to the
 `admin` login only and admin-gated server-side; neither d nor x is
 persisted.
 
+**⚔ Knockout (top 8):** the bracket below the camera view seeds the
+current top 8 of the bias ranking (1v8, 4v5, 3v6, 2v7) and stays **live**
+— teams can still move in and out — until the **first result is entered,
+which freezes the seeding** into `<out-dir>/knockout.tsv`. Click a match
+to enter its game scores (same best-of-three syntax as group matches;
+click again to edit, 🗑 deletes — deleting the last result un-freezes).
+Winners advance automatically to the semis, final and the 🏆.
+Endpoints: `GET /ko`, `POST /ko/add?stage=qf1..qf4|sf1|sf2|f&a=X&b=Y&games=…`,
+`POST /ko/del?stage=X`. Knockout results live outside the group ranking —
+they never touch the PageRank matrix.
+
 One big group; a match is **best of three** to 10; **each pair plays at most
 once**. Enter *team A*, *team B*, game scores from A's view
 (`10-9, 10-4` or `10-1, 5-10, 10-9`) — the winner is derived, incomplete

@@ -3267,9 +3267,9 @@ function renderTable(){if(!S)return;
   const o=document.createElement('option');o.value=t.name;dl.appendChild(o);});
  $('algb').className=alg==='bias'?'on':'';$('algp').className=alg==='plain'?'on':'';
  $('algw').className=alg==='wbias'?'on':'';
- const koDays=Math.ceil((new Date('2026-08-21T23:59:59')-Date.now())/864e5);
+ const koDays=Math.ceil((new Date('2026-08-19T23:59:59')-Date.now())/864e5);
  $('konote').innerHTML='&#9876;&#65039; <b>Top 8 advance to the knockout stage</b> &middot; '
-  +(koDays>1?'group stage ends 21.08. &mdash; <span class="days">'+koDays+' days left</span>'
+  +(koDays>1?'group stage ends 19.08. &mdash; <span class="days">'+koDays+' days left</span>'
    :koDays===1?'group stage ends <span class="days">TOMORROW</span>'
    :koDays===0?'<span class="days">LAST DAY of the group stage!</span>'
    :'group stage finished &mdash; bracket time');

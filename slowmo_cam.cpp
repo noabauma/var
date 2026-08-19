@@ -2286,7 +2286,11 @@ struct KnockoutBoard {
     std::vector<Entry> entries;
 
     static bool stage_ok(const std::string &s) {
-        static const char *k[] = {"qf1", "qf2", "qf3", "qf4", "sf1", "sf2", "f"};
+        static const char *k[] = {"qf1", "qf2", "qf3", "qf4", "sf1", "sf2",
+                                  "f",   // and the losers' bracket:
+                                  "lr1", "lr2",   // QF losers pair up
+                                  "lq1", "lq2",   // winners vs SF losers
+                                  "p3"};          // 3rd/4th place final
         for (const char *x : k)
             if (s == x) return true;
         return false;
@@ -2728,7 +2732,9 @@ button:disabled{opacity:.4;cursor:default}
 #kosec{width:calc(100vw - 28px);max-width:1500px;position:relative;left:50%;transform:translateX(-50%);margin:20px 0 4px;padding:0 8px;box-sizing:border-box}
 #kosec h2{font-size:13px;color:#8b96a5;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin:2px 0 4px}
 #kohint{color:#5c6672;font-size:12px;margin-bottom:10px}
-#kotree{display:flex;gap:30px;align-items:stretch}
+#kotree,#kotree2{display:flex;gap:30px;align-items:stretch}
+#kotree2{margin-top:22px;padding-top:16px;border-top:1px solid #1c2530}
+#kotree2 .kchamp .nm{color:#c98d5a}
 .kocol{display:flex;flex-direction:column;justify-content:space-around;gap:10px;flex:1;min-width:0}
 .kocol h3{font-size:11px;color:#5c6672;text-transform:uppercase;letter-spacing:.5px;margin:0;text-align:center}
 .kmatch{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:6px 10px;position:relative;cursor:pointer}
@@ -2866,11 +2872,6 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </aside>
 <div id="wrap"><img id="cam" src="/stream" alt="live"><video id="vid" controls playsinline hidden></video><div id="privacy" hidden>&#128247; Camera is OFF<span>nothing is being captured or stored</span></div><div id="livematch" hidden></div><div id="goalspeed" hidden></div><div id="badge" hidden>REPLAY</div><button id="fs" title="fullscreen (f)"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 1H1v4M9 1h4v4M5 13H1V9M9 13h4V9"/></svg></button></div>
 </main>
-<section id="kosec">
-<h2>&#9876;&#65039; Knockout &mdash; top 8</h2>
-<div id="kohint"></div>
-<div id="kotree"></div>
-</section>
 <footer>
 <button id="save">&#128308; Save + replay</button>
 <button id="again" disabled>&#8635; Replay last</button>
@@ -2883,6 +2884,12 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <option value="5">5 fps</option>
 </select>
 </footer>
+<section id="kosec">
+<h2>&#9876;&#65039; Knockout &mdash; top 8</h2>
+<div id="kohint"></div>
+<div id="kotree"></div>
+<div id="kotree2"></div>
+</section>
 <section id="board">
 <h2>Manage tournament</h2>
 <div id="detail" hidden></div>
@@ -3415,6 +3422,7 @@ function renderKO(){const t=$('kotree');if(!KO||!t)return;t.innerHTML='';
   else div.style.cursor='default';
   return div;}
  const wOf=st=>M[st]?M[st].w:null;
+ const lOf=st=>M[st]?(M[st].w===M[st].a?M[st].b:M[st].a):null;
  const cQ=document.createElement('div');cQ.className='kocol';
  cQ.innerHTML='<h3>Quarter-finals</h3>';
  ['qf1','qf2','qf3','qf4'].forEach((st,i)=>{const p=qp[i];
@@ -3432,7 +3440,28 @@ function renderKO(){const t=$('kotree');if(!KO||!t)return;t.innerHTML='';
  const cn=document.createElement('div');cn.className='nm';
  cn.textContent=wOf('f')||'—';
  cC.appendChild(cup);cC.appendChild(cn);
- t.appendChild(cQ);t.appendChild(cS);t.appendChild(cF);t.appendChild(cC);}
+ t.appendChild(cQ);t.appendChild(cS);t.appendChild(cF);t.appendChild(cC);
+ // ---- the losing tree: QF losers pair up, winners meet the SF losers
+ // (crossed, so nobody rematches the team that just beat them), and those
+ // two winners play the 3rd/4th place final
+ const t2=$('kotree2');t2.innerHTML='';
+ const cL1=document.createElement('div');cL1.className='kocol';
+ cL1.innerHTML='<h3>Losers round 1</h3>';
+ cL1.appendChild(card('lr1',lOf('qf1'),lOf('qf2'),'loser QF1','loser QF2'));
+ cL1.appendChild(card('lr2',lOf('qf3'),lOf('qf4'),'loser QF3','loser QF4'));
+ const cL2=document.createElement('div');cL2.className='kocol';
+ cL2.innerHTML='<h3>Losers round 2</h3>';
+ cL2.appendChild(card('lq1',wOf('lr1'),lOf('sf2'),'winner LR1','loser SF2'));
+ cL2.appendChild(card('lq2',wOf('lr2'),lOf('sf1'),'winner LR2','loser SF1'));
+ const cP=document.createElement('div');cP.className='kocol';
+ cP.innerHTML='<h3>3rd place final</h3>';
+ cP.appendChild(card('p3',wOf('lq1'),wOf('lq2'),'winner LQ1','winner LQ2'));
+ const cM=document.createElement('div');cM.className='kchamp';
+ const med=document.createElement('div');med.className='cup';med.textContent='🥉';
+ const mn=document.createElement('div');mn.className='nm';
+ mn.textContent=wOf('p3')||'—';
+ cM.appendChild(med);cM.appendChild(mn);
+ t2.appendChild(cL1);t2.appendChild(cL2);t2.appendChild(cP);t2.appendChild(cM);}
 $('algb').onclick=()=>{alg='bias';renderTable();renderDetail();};
 $('algp').onclick=()=>{alg='plain';renderTable();renderDetail();};
 $('algw').onclick=()=>{alg='wbias';renderTable();renderDetail();};

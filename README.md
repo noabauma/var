@@ -135,7 +135,13 @@ which freezes the seeding** into `<out-dir>/knockout.tsv`. Click a match
 to enter its game scores (same best-of-three syntax as group matches;
 click again to edit, 🗑 deletes — deleting the last result un-freezes).
 Winners advance automatically to the semis, final and the 🏆.
-Endpoints: `GET /ko`, `POST /ko/add?stage=qf1..qf4|sf1|sf2|f&a=X&b=Y&games=…`,
+Below the main tree, the **losing tree** plays out places 3–8: the four
+QF losers pair up (loser QF1 vs loser QF2, loser QF3 vs loser QF4), the
+winners meet the SF losers **crossed** (winner LR1 vs loser SF2, winner
+LR2 vs loser SF1 — nobody rematches the team that just beat them), and
+those two winners contest the 🥉 3rd-place final.
+Endpoints: `GET /ko`,
+`POST /ko/add?stage=qf1..qf4|sf1|sf2|f|lr1|lr2|lq1|lq2|p3&a=X&b=Y&games=…`,
 `POST /ko/del?stage=X`. Knockout results live outside the group ranking —
 they never touch the PageRank matrix.
 

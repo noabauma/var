@@ -79,10 +79,14 @@ Endpoints: `GET /bets`, `POST /bets/open?a=X&b=Y`,
 `POST /bets/place?who=N&pick=X`, `POST /bets/cancel`.
 
 **📷 Camera ON/OFF (privacy switch):** anyone can pause recording from the
-page. OFF truly stops capture — the V4L2 device is closed, the ring buffer
-is wiped (nothing from before the press can be saved), `/save` is refused,
-and the video area shows "Camera is OFF". ON brings it back in ~2 s.
-Saved clips on disk are not affected. `POST /camera?on=0|1`.
+page. OFF discards every frame the moment it arrives — the ring buffer is
+wiped (nothing from before the press can be saved), nothing new is stored
+or served, `/save` and `/frame` are refused, and the video area shows
+"Camera is OFF". ON is instant. Saved clips on disk are not affected.
+`POST /camera?on=0|1`. (The device itself stays open and streaming into
+the void: the AR0234's USB bridge can return from a close+reopen as a
+zombie — and USB-resetting that zombie once oopsed the kernel — so
+close/reopen is avoided entirely.)
 
 **⚽ Goal speed:** after each save is converted to MP4, `speed/ball_speed.py`
 replays the clip in the background (~40 s, nice'd): it finds the moving

@@ -384,7 +384,7 @@ struct Shared {
     }
     std::atomic<bool> alive{true};
     std::atomic<bool> cam_ok{false};      // camera currently streaming
-    std::atomic<bool> cam_enabled{true};  // web privacy switch (OFF = no capture)
+    std::atomic<bool> cam_enabled{true};  // privacy switch (OFF = frames discarded)
     std::atomic<int> viewers{0};     // browsers currently receiving video
     std::atomic<bool> save_busy{false};
     std::atomic<bool> interactive{false};
@@ -1244,7 +1244,13 @@ static bool v4l2_capture_once(const Cfg &cfg, Shared *sh, std::string &err) {
 
     uint32_t expected_seq = 0;
     bool have_seq = false;
-    while (sh->alive && !g_stop && sh->cam_enabled) {
+    // NOTE: the privacy switch does NOT end this loop. The AR0234's USB
+    // bridge can come back from a V4L2 close+reopen as a zombie (accepts
+    // every command, streams nothing) and a USB reset of that zombie can
+    // oops the kernel — so the device stays open and streaming, and OFF
+    // simply discards every frame right here in the loop (nothing is
+    // stored, served or savable; the ring is wiped by the /camera handler).
+    while (sh->alive && !g_stop) {
         pollfd p{fd, POLLIN, 0};
         int r = poll(&p, 1, 200);
         if (r < 0) {
@@ -1274,6 +1280,8 @@ static bool v4l2_capture_once(const Cfg &cfg, Shared *sh, std::string &err) {
                 sh->drops += b.sequence - expected_seq;
             expected_seq = b.sequence + 1;
             have_seq = true;
+        } else if (!sh->cam_enabled) {
+            have_seq = false; // discard mode: don't count the gap as drops
         }
         bool qbuf_ok = xioctl(fd, VIDIOC_QBUF, &b) == 0;
         INSTRUMENTATION_MARK_RESET(TR_CH_CAPTURE);
@@ -1295,20 +1303,10 @@ static void v4l2_capture_thread(Cfg cfg, Shared *sh) {
     TrThreadGuard tr_guard;
     bool announced = false;
     while (sh->alive && !g_stop) {
-        if (!sh->cam_enabled) { // privacy switch: device stays closed
-            poll(nullptr, 0, 100);
-            continue;
-        }
         std::string err;
         bool clean = v4l2_capture_once(cfg, sh, err);
         bool was_streaming = sh->cam_ok.exchange(false);
-        if (clean) {
-            if (!sh->cam_enabled && sh->alive && !g_stop) {
-                sh->ring.clear(); // capture has stopped: no frame can slip in
-                continue;         // paused — wait for the switch
-            }
-            break; // shutdown
-        }
+        if (clean) break; // only a shutdown ends a session cleanly now
         if (was_streaming || !announced) {
             sh->msgs.push("camera unavailable (" + err +
                           ") — retrying every 2 s; the web page stays up");

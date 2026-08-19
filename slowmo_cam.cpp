@@ -2793,6 +2793,12 @@ button:disabled{opacity:.4;cursor:default}
 #rhwrap{overflow-x:auto}
 #rhsvg{width:100%;height:auto;display:block}
 .rh-grid{stroke:#151c25;stroke-width:1}
+#impblock{max-width:780px;margin:18px auto 0}
+#impblock table{width:100%}
+#impblock td.ip{color:#22c55e;font-weight:600}
+#impblock td.in{color:#e57373;font-weight:600}
+#impblock td,#impblock th{white-space:nowrap}
+#impblock td:nth-child(2){white-space:normal}
 .rh-cut{stroke:#e5c07b;stroke-width:1.5;stroke-dasharray:7 5}
 .rh-cutlbl{fill:#e5c07b;font-size:10px;letter-spacing:.5px}
 .rh-rank,.rh-x{fill:#5c6672;font:11px system-ui,sans-serif}
@@ -2907,6 +2913,13 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <svg id="gsvg" viewBox="0 0 560 400" role="img" aria-label="who beat whom, as a graph"></svg>
 <div id="gcap"><span class="sw" style="background:#81c784"></span>wins <span class="sw" style="background:#e57373"></span>losses of the hovered team · arrow points at the loser · click selects</div>
 </div>
+</div>
+<div id="impblock" hidden>
+<h3>Biggest wins &mdash; ranking points per match</h3>
+<table><thead><tr><th>#</th><th>match</th><th>games</th>
+<th title="leave-one-out: the winner's score with this match minus without it">winner gained</th>
+<th title="leave-one-out: the loser's score with this match minus without it — often positive thanks to the participation baseline">loser gained</th>
+</tr></thead><tbody id="imptb"></tbody></table>
 </div>
 <div id="rhblock" hidden>
 <h3>Rank history</h3>
@@ -3273,7 +3286,29 @@ function renderTable(){if(!S)return;
    :koDays===1?'group stage ends <span class="days">TOMORROW</span>'
    :koDays===0?'<span class="days">LAST DAY of the group stage!</span>'
    :'group stage finished &mdash; bracket time');
- renderVs(idx);renderGraph(idx);}
+ renderVs(idx);renderGraph(idx);renderImpTable();}
+function renderImpTable(){const blk=$('impblock'),tb=$('imptb');
+ if(!S||!IMP||!S.matches.length){blk.hidden=true;return;}
+ const rows=[];
+ S.matches.forEach(m=>{const l=m.winner===m.a?m.b:m.a;
+  const im=IMP[m.winner+'-'+l];if(!im)return;
+  const [gw,gl]=impWL(im);
+  rows.push({w:S.teams[m.winner].name,l:S.teams[l].name,
+   g:m.games.length?fmtGames(m,m.winner===m.a):'—',gw:gw*100,gl:gl*100,
+   wi:m.winner,li:l});});
+ if(!rows.length){blk.hidden=true;return;}
+ rows.sort((a,b)=>b.gw-a.gw);
+ blk.hidden=false;tb.innerHTML='';
+ const f=v=>(v>=0?'+':'−')+Math.abs(v).toFixed(2);
+ rows.forEach((r,i)=>{const tr=document.createElement('tr');
+  [i+1,r.w+'  beat  '+r.l,r.g,f(r.gw),f(r.gl)].forEach((v,c)=>{
+   const td=document.createElement('td');td.textContent=v;
+   if(c>=3)td.className=(c===3?r.gw:r.gl)>=0?'ip':'in';
+   tr.appendChild(td);});
+  tr.onclick=()=>{selTeam=r.wi;renderDetail();renderTable();};
+  tr.style.cursor='pointer';
+  tr.title='click to select '+r.w+' — values follow the '+ALGN[alg]+' ranking';
+  tb.appendChild(tr);});}
 let HIST=null;
 async function rankhist(){try{const h=await(await fetch('/scores/history')).json();
  if(h.ok){HIST=h;drawRankHist();}}catch(e){}}

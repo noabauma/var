@@ -2734,6 +2734,17 @@ button:disabled{opacity:.4;cursor:default}
 #kohint{color:#5c6672;font-size:12px;margin-bottom:10px}
 #kotree,#kotree2{display:flex;gap:30px;align-items:stretch}
 #kotree2{margin-top:22px;padding-top:16px;border-top:1px solid #1c2530}
+#koedit{position:fixed;inset:0;background:rgba(5,7,10,.72);display:flex;align-items:center;justify-content:center;z-index:20}
+#koedit[hidden]{display:none}
+.kebox{background:#141a21;border:1px solid #2a3644;border-radius:12px;padding:18px 20px;min-width:min(420px,92vw);box-shadow:0 8px 40px rgba(0,0,0,.5)}
+#ketitle{font-weight:700;margin-bottom:10px}
+#ketitle small{display:block;color:#8b96a5;font-weight:400;margin-top:3px}
+#kegames{width:100%;box-sizing:border-box;font:inherit;background:#0b0e12;border:1px solid #1c2530;color:#dfe6ee;border-radius:8px;padding:9px 12px}
+.kerow{display:flex;gap:8px;margin-top:12px}
+.kerow button{padding:8px 14px}
+#keok{background:#1d4ed8}
+#kedel{background:#7f1d1d}
+#keerr{color:#e57373;font-size:13px;min-height:1.2em;margin-top:8px}
 #kotree2 .kchamp .nm{color:#c98d5a}
 .kocol{display:flex;flex-direction:column;justify-content:space-around;gap:10px;flex:1;min-width:0}
 .kocol h3{font-size:11px;color:#5c6672;text-transform:uppercase;letter-spacing:.5px;margin:0;text-align:center}
@@ -2889,6 +2900,18 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <div id="kohint"></div>
 <div id="kotree"></div>
 <div id="kotree2"></div>
+<div id="koedit" hidden>
+<div class="kebox">
+<div id="ketitle"></div>
+<input id="kegames" placeholder="10-7, 10-3" autocomplete="off">
+<div class="kerow">
+<button id="keok">Save result</button>
+<button id="kedel" hidden>&#128465; Delete</button>
+<button id="kecancel">Cancel</button>
+</div>
+<div id="keerr"></div>
+</div>
+</div>
 </section>
 <section id="board">
 <h2>Manage tournament</h2>
@@ -3376,9 +3399,40 @@ async function scores(){try{const s=await(await fetch('/scores')).json();
   $('dsl').value=S.d;$('dnum').value=(+S.d).toFixed(2);} // don't fight the editing hand
  if(S.x!==undefined&&document.activeElement!==$('xnum'))$('xnum').value=S.x;
  renderTable();renderDetail();rankhist();koFetch();}catch(e){}}
-let KO=null;
+let KO=null,keStage=null;
 async function koFetch(){try{const j=await(await fetch('/ko')).json();
  if(j.ok){KO=j;renderKO();}}catch(e){}}
+const STAGEN={qf1:'Quarter-final 1',qf2:'Quarter-final 2',qf3:'Quarter-final 3',
+ qf4:'Quarter-final 4',sf1:'Semi-final 1',sf2:'Semi-final 2',f:'FINAL',
+ lr1:'Losers round 1',lr2:'Losers round 1',lq1:'Losers round 2',
+ lq2:'Losers round 2',p3:'3rd place final'};
+function koEdit(stage,ta,tb,games){ // in-page dialog: prompt() is blocked
+ keStage={stage,ta,tb,had:!!games};  // in webviews (VS Code Simple Browser)
+ $('ketitle').innerHTML='';
+ const b=document.createElement('b');b.textContent=STAGEN[stage]+': '+ta+' vs '+tb;
+ const s=document.createElement('small');
+ s.textContent="game scores from "+ta+"'s view — best of three to 10";
+ $('ketitle').appendChild(b);$('ketitle').appendChild(s);
+ $('kegames').value=games;$('keerr').textContent='';
+ $('kedel').hidden=!games;
+ $('koedit').hidden=false;$('kegames').focus();}
+function koClose(){$('koedit').hidden=true;keStage=null;}
+$('kecancel').onclick=koClose;
+$('koedit').onclick=ev=>{if(ev.target===$('koedit'))koClose();};
+$('keok').onclick=async()=>{if(!keStage)return;
+ const g=$('kegames').value.trim();
+ if(!g){$('keerr').textContent='enter the game scores, e.g. 10-7, 10-3';return;}
+ try{const r=await(await fetch('/ko/add?stage='+keStage.stage+'&a='+enc(keStage.ta)
+  +'&b='+enc(keStage.tb)+'&games='+enc(g),{method:'POST'})).json();
+  if(!r.ok){$('keerr').textContent=r.error;return;}
+  koClose();koFetch();}catch(e){$('keerr').textContent='connection lost';}};
+$('kedel').onclick=async()=>{if(!keStage)return;
+ try{const r=await(await fetch('/ko/del?stage='+keStage.stage,{method:'POST'})).json();
+  if(!r.ok){$('keerr').textContent=r.error;return;}
+  koClose();koFetch();}catch(e){$('keerr').textContent='connection lost';}};
+$('kegames').addEventListener('keydown',ev=>{
+ if(ev.key==='Enter')$('keok').click();
+ if(ev.key==='Escape')koClose();});
 function renderKO(){const t=$('kotree');if(!KO||!t)return;t.innerHTML='';
  const seeds=KO.seeds||[],M=KO.matches||{};
  $('kohint').textContent=KO.frozen
@@ -3388,11 +3442,6 @@ function renderKO(){const t=$('kotree');if(!KO||!t)return;t.innerHTML='';
     :'the bracket needs 8 ranked teams');
  const seedNo={};seeds.forEach((n,i)=>seedNo[n]=i+1);
  const qp=[[0,7],[3,4],[2,5],[1,6]]; // 1v8, 4v5, 3v6, 2v7
- function postGames(stage,ta,tb,prev){
-  const g=prompt('Game scores '+ta+' vs '+tb+" (from "+ta+"'s view, e.g. 10-7, 10-3):",prev||'');
-  if(g==null||!g.trim())return;
-  fetch('/ko/add?stage='+stage+'&a='+enc(ta)+'&b='+enc(tb)+'&games='+enc(g.trim()),
-   {method:'POST'}).then(r=>r.json()).then(r=>{if(!r.ok)alert(r.error);koFetch();});}
  function card(stage,a,b,fa,fb){
   const e=M[stage],ta=e?e.a:a,tb=e?e.b:b;
   const div=document.createElement('div');
@@ -3411,14 +3460,7 @@ function renderKO(){const t=$('kotree');if(!KO||!t)return;t.innerHTML='';
    const scs=document.createElement('span');scs.className='sc';
    scs.textContent=e?sc:'';
    r.appendChild(ns);r.appendChild(scs);div.appendChild(r);});
-  if(e){const del=document.createElement('button');del.className='kdel';
-   del.textContent='🗑';del.title='delete this knockout result';
-   del.onclick=ev=>{ev.stopPropagation();
-    if(confirm('Delete the '+stage.toUpperCase()+' result?'))
-     fetch('/ko/del?stage='+stage,{method:'POST'}).then(()=>koFetch());};
-   div.appendChild(del);
-   div.onclick=()=>postGames(stage,ta,tb,e.games.replace(/,/g,', '));}
-  else if(ta&&tb)div.onclick=()=>postGames(stage,ta,tb);
+  if(ta&&tb)div.onclick=()=>koEdit(stage,ta,tb,e?e.games.replace(/,/g,', '):'');
   else div.style.cursor='default';
   return div;}
  const wOf=st=>M[st]?M[st].w:null;

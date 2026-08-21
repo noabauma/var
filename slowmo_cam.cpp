@@ -1250,6 +1250,7 @@ static bool v4l2_capture_once(const Cfg &cfg, Shared *sh, std::string &err) {
     // oops the kernel — so the device stays open and streaming, and OFF
     // simply discards every frame right here in the loop (nothing is
     // stored, served or savable; the ring is wiped by the /camera handler).
+    double last_frame = now_mono(); // zombie watchdog (see below)
     while (sh->alive && !g_stop) {
         pollfd p{fd, POLLIN, 0};
         int r = poll(&p, 1, 200);
@@ -1258,7 +1259,16 @@ static bool v4l2_capture_once(const Cfg &cfg, Shared *sh, std::string &err) {
             err = errno_str("poll(camera)");
             break;
         }
-        if (r == 0) continue;
+        if (r == 0) {
+            // the AR0234's bridge can spontaneously go zombie: negotiated,
+            // "streaming", delivering nothing. Bail out so the supervisor
+            // reopens the device (retrying every 2s until frames flow).
+            if (now_mono() - last_frame > 8.0) {
+                err = "camera delivered no frames for 8s (zombie) — reopening";
+                break;
+            }
+            continue;
+        }
 
         v4l2_buffer b{};
         b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -1283,6 +1293,7 @@ static bool v4l2_capture_once(const Cfg &cfg, Shared *sh, std::string &err) {
         } else if (!sh->cam_enabled) {
             have_seq = false; // discard mode: don't count the gap as drops
         }
+        last_frame = now_mono(); // any dequeued buffer counts as life
         bool qbuf_ok = xioctl(fd, VIDIOC_QBUF, &b) == 0;
         INSTRUMENTATION_MARK_RESET(TR_CH_CAPTURE);
         if (!qbuf_ok) {
@@ -1521,12 +1532,14 @@ struct ScoreBoard {
     // best-of-three: a complete match is exactly 2-0 or 2-1 in games
     static bool bo3_ok(const std::vector<Game> &gs, int &wa, int &wb,
                        std::string &err) {
+        // flexible format: each game goes to whoever scored more (play to
+        // 10, to 7, or deuce — any non-tied score counts), and the match
+        // goes to whoever won more games
         wa = wb = 0;
         for (const auto &g : gs) (g.a > g.b ? wa : wb)++;
-        int hi = wa > wb ? wa : wb, lo = wa + wb - hi;
-        if (hi != 2 || lo > 1) {
-            err = "best-of-three: a match ends when a team wins its 2nd game "
-                  "— enter 2 or 3 games, e.g. 10-9, 10-4  or  10-1, 5-10, 10-9";
+        if (wa == wb) {
+            err = "a match cannot end tied — one team must win more games "
+                  "than the other, e.g. 10-9, 10-4  or  7-5, 4-7, 11-9";
             return false;
         }
         return true;
@@ -2887,7 +2900,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <button id="save">&#128308; Save + replay</button>
 <button id="again" disabled>&#8635; Replay last</button>
 <button id="live">&#9679; Live</button>
-<button id="camtoggle" title="privacy switch: OFF stops capturing and clears the buffer">&#128247; &hellip;</button>
+<button id="camtoggle" hidden title="privacy switch (admin only): OFF discards all frames and clears the buffer">&#128247; &hellip;</button>
 <select id="rate" title="live-stream rate — pick a lower one on slow connections (VPN, weak WiFi) for a smooth picture">
 <option value="">30 fps</option>
 <option value="15">15 fps</option>
@@ -2963,7 +2976,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 <li>First, we play a round-robin tournament, followed by a knockout bracket of the 8 best teams. If there are more than 14 teams, we'll switch to group-based round-robins.</li>
 <li>The scores are based on a PageRank algorithm (<a href="https://onebox.huawei.com/p/a10f2a69c808860e21e3f74fd8537490" target="_blank" rel="noopener">see the code here</a>).</li>
 <li>Each match is played as a best-of-three (first team to win 2 games).</li>
-<li>A game is made up of rounds and is won by the first team to score 10 goals/points. There will be no deuce &mdash; no need to win by two; first to 10 takes the game.</li>
+<li>A game is made up of rounds and is won by whichever team scores more goals/points &mdash; agree the target before you start: straight to 10, deuce (win by two), or a short game to 7 all count. The match goes to the team with more games won.</li>
 <li>A round is won when a goal is scored.</li>
 <li>There will be prizes for the top 3 teams.</li>
 <li>The default playtime is during lunch, 12:00&ndash;13:00 (but we expect you to arrange your own playtimes, since not everyone can play at lunch).</li>
@@ -3043,7 +3056,7 @@ cam.onerror=()=>setTimeout(()=>{if(badge.hidden)live();},1500);
   updAgain();
   camOn=s.cam_on!==false;
   if(isAdmin!==(s.admin===true)){isAdmin=s.admin===true;
-   $('algsw').hidden=!isAdmin;renderRecs();}
+   $('algsw').hidden=!isAdmin;$('camtoggle').hidden=!isAdmin;renderRecs();}
   $('camtoggle').textContent=camOn?'📷 Camera ON':'📷 Camera OFF';
   $('camtoggle').className=camOn?'':'off';
   $('privacy').hidden=camOn||!badge.hidden;
@@ -3411,7 +3424,7 @@ function koEdit(stage,ta,tb,games){ // in-page dialog: prompt() is blocked
  $('ketitle').innerHTML='';
  const b=document.createElement('b');b.textContent=STAGEN[stage]+': '+ta+' vs '+tb;
  const s=document.createElement('small');
- s.textContent="game scores from "+ta+"'s view — best of three to 10";
+ s.textContent="game scores from "+ta+"'s view — most game wins takes the match";
  $('ketitle').appendChild(b);$('ketitle').appendChild(s);
  $('kegames').value=games;$('keerr').textContent='';
  $('kedel').hidden=!games;
@@ -3783,6 +3796,22 @@ struct ViewerCount {
     ~ViewerCount() { sh->viewers--; }
 };
 
+// Detect a client that hung up while we had nothing to send (empty ring:
+// camera off or wedged). Without this, idle stream connections wait for a
+// first frame forever and the viewer counter only ever goes up.
+static bool client_gone(int fd) {
+    pollfd p{fd, POLLIN, 0};
+    if (poll(&p, 1, 0) <= 0) return false;
+    if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+    if (p.revents & POLLIN) {
+        char b[64];
+        ssize_t r = recv(fd, b, sizeof b, MSG_DONTWAIT);
+        if (r == 0) return true; // orderly close
+        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return true;
+    }
+    return false;
+}
+
 static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
     if (fps > cfg.capture_fps) fps = cfg.capture_fps;
     bound_stream_buffer(fd);
@@ -3798,7 +3827,11 @@ static void handle_stream(int fd, const Cfg &cfg, Shared *sh, int fps) {
             continue;
         }
         Frame f = sh->ring.latest();
-        if (!f) { next = t + 0.1; continue; }
+        if (!f) {
+            if (client_gone(fd)) return; // don't wait for frames forever
+            next = t + 0.1;
+            continue;
+        }
         INSTRUMENTATION_MARK_SET(g_tr_ch, g_tr.stream_send,
                                  (uint32_t)(f->size() >> 10));
         bool sent = send_part(fd, *f, sh);
@@ -4189,17 +4222,22 @@ static void http_client_thread(int fd, Cfg cfg, Shared *sh, HttpState *st) {
         else if (method == "POST" && route == "/recordings/delete")
             handle_recording_delete(fd, cfg, sh, path);
         else if (method == "POST" && route == "/camera") {
-            bool on = query_str(path, "on") == "1";
-            bool was = sh->cam_enabled.exchange(on);
-            if (!on && was) {
-                sh->ring.clear(); // privacy: footage before OFF is gone too
-                sh->msgs.push("camera switched OFF from the web page (buffer cleared)");
-            } else if (on && !was) {
-                sh->msgs.push("camera switched ON from the web page");
+            if (!admin) {
+                send_simple(fd, sh, "403 Forbidden", "application/json",
+                            "{\"ok\":false,\"error\":\"the camera switch is admin-only\"}");
+            } else {
+                bool on = query_str(path, "on") == "1";
+                bool was = sh->cam_enabled.exchange(on);
+                if (!on && was) {
+                    sh->ring.clear(); // privacy: footage before OFF is gone
+                    sh->msgs.push("camera switched OFF from the web page (buffer cleared)");
+                } else if (on && !was) {
+                    sh->msgs.push("camera switched ON from the web page");
+                }
+                send_simple(fd, sh, "200 OK", "application/json",
+                            on ? "{\"ok\":true,\"cam_on\":true}"
+                               : "{\"ok\":true,\"cam_on\":false}");
             }
-            send_simple(fd, sh, "200 OK", "application/json",
-                        on ? "{\"ok\":true,\"cam_on\":true}"
-                           : "{\"ok\":true,\"cam_on\":false}");
         }
         else if (method == "GET" && route == "/frame") {
             // one still frame for the CV referee (and anyone else)

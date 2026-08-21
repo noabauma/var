@@ -78,8 +78,9 @@ leaderboard tracks points and records in `<out-dir>/bets.tsv`.
 Endpoints: `GET /bets`, `POST /bets/open?a=X&b=Y`,
 `POST /bets/place?who=N&pick=X`, `POST /bets/cancel`.
 
-**📷 Camera ON/OFF (privacy switch):** anyone can pause recording from the
-page. OFF discards every frame the moment it arrives — the ring buffer is
+**📷 Camera ON/OFF (privacy switch, admin-only):** the `admin` login can
+pause recording from the page (server-gated: `POST /camera` returns 403
+for others). OFF discards every frame the moment it arrives — the ring buffer is
 wiped (nothing from before the press can be saved), nothing new is stored
 or served, `/save` and `/frame` are refused, and the video area shows
 "Camera is OFF". ON is instant. Saved clips on disk are not affected.
@@ -145,10 +146,11 @@ Endpoints: `GET /ko`,
 `POST /ko/del?stage=X`. Knockout results live outside the group ranking —
 they never touch the PageRank matrix.
 
-One big group; a match is **best of three** to 10; **each pair plays at most
-once**. Enter *team A*, *team B*, game scores from A's view
-(`10-9, 10-4` or `10-1, 5-10, 10-9`) — the winner is derived, incomplete
-best-of-threes and rematches are rejected. New names create teams
+One big group; **each pair plays at most once**. Enter *team A*, *team B*,
+game scores from A's view (`10-9, 10-4` or `7-5, 4-7, 11-9`) — each game
+goes to whoever scored more (play to 10, to 7, or deuce — any non-tied
+score counts), the match to whoever won more games; tied matches and
+rematches are rejected. New names create teams
 (**Add team** also works); click a team row for its match history, per-match
 ✎ edit / 🗑 delete, **rename**, and **Delete team**. **Undo** removes the
 last match. Below the table: head-to-head **matrix + directed graph**.

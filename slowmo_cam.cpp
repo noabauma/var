@@ -2303,7 +2303,9 @@ struct KnockoutBoard {
                                   "f",   // and the losers' bracket:
                                   "lr1", "lr2",   // QF losers pair up
                                   "lq1", "lq2",   // winners vs SF losers
-                                  "p3"};          // 3rd/4th place final
+                                  "p3",           // losers semi-final
+                                  "lf",           // losers final: vs the WF loser
+                                  "gf"};          // grand final
         for (const char *x : k)
             if (s == x) return true;
         return false;
@@ -2759,6 +2761,7 @@ button:disabled{opacity:.4;cursor:default}
 #kedel{background:#7f1d1d}
 #keerr{color:#e57373;font-size:13px;min-height:1.2em;margin-top:8px}
 #kotree2 .kchamp .nm{color:#c98d5a}
+.kchamp .nm2{font-size:12px;color:#8b96a5;text-align:center}
 .kocol{display:flex;flex-direction:column;justify-content:space-around;gap:10px;flex:1;min-width:0}
 .kocol h3{font-size:11px;color:#5c6672;text-transform:uppercase;letter-spacing:.5px;margin:0;text-align:center}
 .kmatch{background:#141a21;border:1px solid #1c2530;border-radius:10px;padding:6px 10px;position:relative;cursor:pointer}
@@ -3416,9 +3419,10 @@ let KO=null,keStage=null;
 async function koFetch(){try{const j=await(await fetch('/ko')).json();
  if(j.ok){KO=j;renderKO();}}catch(e){}}
 const STAGEN={qf1:'Quarter-final 1',qf2:'Quarter-final 2',qf3:'Quarter-final 3',
- qf4:'Quarter-final 4',sf1:'Semi-final 1',sf2:'Semi-final 2',f:'FINAL',
+ qf4:'Quarter-final 4',sf1:'Semi-final 1',sf2:'Semi-final 2',f:'Winners final',
  lr1:'Losers round 1',lr2:'Losers round 1',lq1:'Losers round 2',
- lq2:'Losers round 2',p3:'3rd place final'};
+ lq2:'Losers round 2',p3:'Losers semi-final',
+ lf:'Losers final (loser is 3rd)',gf:'GRAND FINAL'};
 function koEdit(stage,ta,tb,games){ // in-page dialog: prompt() is blocked
  keStage={stage,ta,tb,had:!!games};  // in webviews (VS Code Simple Browser)
  $('ketitle').innerHTML='';
@@ -3488,17 +3492,24 @@ function renderKO(){const t=$('kotree');if(!KO||!t)return;t.innerHTML='';
  cS.appendChild(card('sf1',wOf('qf1'),wOf('qf2'),'winner QF1','winner QF2'));
  cS.appendChild(card('sf2',wOf('qf3'),wOf('qf4'),'winner QF3','winner QF4'));
  const cF=document.createElement('div');cF.className='kocol';
- cF.innerHTML='<h3>Final</h3>';
+ cF.innerHTML='<h3>Winners final</h3>';
  cF.appendChild(card('f',wOf('sf1'),wOf('sf2'),'winner SF1','winner SF2'));
+ const cG=document.createElement('div');cG.className='kocol';
+ cG.innerHTML='<h3>Grand final</h3>';
+ cG.appendChild(card('gf',wOf('f'),wOf('lf'),'winner WF','winner losers final'));
  const cC=document.createElement('div');cC.className='kchamp';
  const cup=document.createElement('div');cup.className='cup';cup.textContent='🏆';
  const cn=document.createElement('div');cn.className='nm';
- cn.textContent=wOf('f')||'—';
- cC.appendChild(cup);cC.appendChild(cn);
- t.appendChild(cQ);t.appendChild(cS);t.appendChild(cF);t.appendChild(cC);
- // ---- the losing tree: QF losers pair up, winners meet the SF losers
- // (crossed, so nobody rematches the team that just beat them), and those
- // two winners play the 3rd/4th place final
+ cn.textContent=wOf('gf')||'—';
+ const sn=document.createElement('div');sn.className='nm2';
+ sn.textContent=lOf('gf')?'🥈 '+lOf('gf'):'';
+ cC.appendChild(cup);cC.appendChild(cn);cC.appendChild(sn);
+ t.appendChild(cQ);t.appendChild(cS);t.appendChild(cF);t.appendChild(cG);t.appendChild(cC);
+ // ---- the losing tree (double elimination): QF losers pair up, winners
+ // meet the SF losers (crossed, so nobody rematches the team that just
+ // beat them), those winners play the losers semi, whose winner meets the
+ // winners-final loser in the losers final — the loser there is 3rd, the
+ // winner climbs back into the grand final
  const t2=$('kotree2');t2.innerHTML='';
  const cL1=document.createElement('div');cL1.className='kocol';
  cL1.innerHTML='<h3>Losers round 1</h3>';
@@ -3509,14 +3520,19 @@ function renderKO(){const t=$('kotree');if(!KO||!t)return;t.innerHTML='';
  cL2.appendChild(card('lq1',wOf('lr1'),lOf('sf2'),'winner LR1','loser SF2'));
  cL2.appendChild(card('lq2',wOf('lr2'),lOf('sf1'),'winner LR2','loser SF1'));
  const cP=document.createElement('div');cP.className='kocol';
- cP.innerHTML='<h3>3rd place final</h3>';
+ cP.innerHTML='<h3>Losers semi-final</h3>';
  cP.appendChild(card('p3',wOf('lq1'),wOf('lq2'),'winner LQ1','winner LQ2'));
+ const cLF=document.createElement('div');cLF.className='kocol';
+ cLF.innerHTML='<h3>Losers final</h3>';
+ cLF.appendChild(card('lf',wOf('p3'),lOf('f'),'winner losers semi','loser winners final'));
  const cM=document.createElement('div');cM.className='kchamp';
  const med=document.createElement('div');med.className='cup';med.textContent='🥉';
  const mn=document.createElement('div');mn.className='nm';
- mn.textContent=wOf('p3')||'—';
- cM.appendChild(med);cM.appendChild(mn);
- t2.appendChild(cL1);t2.appendChild(cL2);t2.appendChild(cP);t2.appendChild(cM);}
+ mn.textContent=lOf('lf')||'—';
+ const mh=document.createElement('div');mh.className='nm2';
+ mh.textContent=wOf('lf')?'winner → grand final':'loser of the losers final';
+ cM.appendChild(med);cM.appendChild(mn);cM.appendChild(mh);
+ t2.appendChild(cL1);t2.appendChild(cL2);t2.appendChild(cP);t2.appendChild(cLF);t2.appendChild(cM);}
 $('algb').onclick=()=>{alg='bias';renderTable();renderDetail();};
 $('algp').onclick=()=>{alg='plain';renderTable();renderDetail();};
 $('algw').onclick=()=>{alg='wbias';renderTable();renderDetail();};

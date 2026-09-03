@@ -2987,7 +2987,7 @@ kbd{background:#1c2530;border-radius:4px;padding:1px 5px;font-size:12px}
 </ul></aside>
 <aside id="rules"><h2>Rules</h2><ul>
 <li>Scoring with the middle row (the 5-bar) is allowed, but not on the first touch of the round: the ball must first bounce off another player or a wall.</li>
-<li>A rod/figure may not rotate more than 360&deg; before hitting the ball, nor more than 360&deg; after hitting it. The "before" and "after" rotations are judged separately and are not added together.</li>
+<li>A rod/figure may not rotate more than 360&deg; before hitting the ball, nor more than 360&deg; after hitting it. The "before" and "after" rotations are judged separately and are not added together. <b>Spinning penalty:</b> a team caught spinning hands the opponents a penalty right away; from that team&rsquo;s 3rd spin in the match onwards, every spin (the 3rd included) gives the opponents a point directly.</li>
 <li>Jarring is NOT allowed.</li>
 <li>Dribbling and passing between your own players in any direction is allowed.</li>
 <li>If the ball enters the goal but pops back out, it still counts as a goal. If it's unclear whether it went in, the round is restarted.</li>
